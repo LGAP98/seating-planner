@@ -220,3 +220,55 @@ ul.plain li:last-child { border-bottom: none; }
 
 /* inline rename */
 .chip span.name[contenteditable=true] { outline: 1px solid var(--accent); border-radius: 3px; padding: 0 2px; cursor: text; }
+
+/* toast notification */
+.toast {
+  position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%) translateY(20px);
+  background: var(--text); color: var(--bg); padding: 10px 16px; border-radius: 8px;
+  font-size: 13px; font-weight: 500; display: flex; align-items: center; gap: 12px;
+  box-shadow: 0 4px 16px rgba(0,0,0,.2); z-index: 2000; opacity: 0; transition: opacity .2s, transform .2s;
+  max-width: 90vw;
+}
+.toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+.toast button {
+  background: none; border: 1px solid; border-radius: 5px; padding: 3px 10px;
+  color: var(--bg); font-weight: 700; font-size: 12px; cursor: pointer; font-family: inherit; flex-shrink: 0;
+}
+.toast button:hover { opacity: .8; }
+
+/* keyboard help overlay */
+.kbd-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.4); z-index: 3000;
+  display: flex; align-items: center; justify-content: center;
+}
+.kbd-panel {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+  box-shadow: 0 8px 32px rgba(0,0,0,.15); padding: 20px 24px; max-width: 520px; width: 90vw;
+}
+.kbd-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; font-size: 14px; }
+.kbd-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+@media (max-width: 500px) { .kbd-grid { grid-template-columns: 1fr; } }
+.kbd-title { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 700; margin-bottom: 8px; }
+.kbd-row { display: flex; gap: 10px; align-items: baseline; margin-bottom: 6px; font-size: 12.5px; }
+.kbd-row span { color: var(--ink, var(--text)); }
+kbd {
+  display: inline-block; background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+  padding: 2px 6px; font-family: inherit; font-size: 11px; font-weight: 600; min-width: 48px;
+  text-align: center; white-space: nowrap; color: var(--text);
+}
+.kbd-help-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 18px; height: 18px; border-radius: 50%; border: 1px solid var(--border);
+  background: var(--panel); color: var(--muted); font-size: 11px; font-weight: 700;
+  cursor: pointer; padding: 0; vertical-align: middle; font-family: inherit;
+}
+.kbd-help-btn:hover { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+
+/* bulk rel paste */
+.minor-summary { cursor: pointer; font-size: 12px; color: var(--muted); padding: 4px 2px; user-select: none; }
+.minor-summary:hover { color: var(--text); }
+#relPaste { margin-bottom: 8px; }
+#relPasteArea {
+  width: 100%; height: 68px; resize: vertical; font-family: inherit; font-size: 12px;
+  padding: 7px 9px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); color: var(--text);
+}

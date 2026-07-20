@@ -51,6 +51,11 @@
         </select>
         <button onclick="addRel()">Add</button>
       </div>
+      <details id="relPaste">
+        <summary class="minor-summary">Paste relationships</summary>
+        <textarea id="relPasteArea" placeholder="One per line: Name A, Name B, type&#10;e.g. Alice, Bob, knows&#10;Types: must / conflict / knows" rows="4"></textarea>
+        <button style="margin-top:4px;width:100%;font-size:12px;" onclick="bulkAddRels()">Add pasted</button>
+      </details>
       <details id="relDetails">
         <summary>Show relationships (<span id="relCount">0</span>)</summary>
         <div class="rel-controls">
@@ -75,7 +80,7 @@
 
   <div class="main">
     <div class="main-toolbar">
-      <span class="hint">3 · Drag a guest onto a seat (or click → click to place) &nbsp;·&nbsp; shift-click two guests to add a relationship &nbsp;·&nbsp; ctrl/cmd + scroll to zoom</span>
+      <span class="hint">3 · Drag or click → click to place &nbsp;·&nbsp; shift-click two guests to link &nbsp;·&nbsp; <button class="kbd-help-btn" onclick="toggleKbdHelp()" title="Keyboard shortcuts">?</button></span>
       <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; justify-content:flex-end;">
         <div class="zoom-controls">
           <button onclick="stepZoom(0.8)" title="Zoom out">−</button>

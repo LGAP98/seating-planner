@@ -42,6 +42,29 @@ function guestById(id) { return state.guests.find(g => g.id === id); }
 function groupById(id) { return state.groups.find(g => g.id === id); }
 function seatedTableOf(guestId) { return state.tables.find(t => t.seats.includes(guestId)); }
 
+// ===== Toast notifications =====
+let toastTimer = null;
+function showToast(msg, undoFn) {
+  dismissToast();
+  const el = document.createElement('div');
+  el.className = 'toast';
+  el.innerHTML = `<span>${msg}</span>`;
+  if (undoFn) {
+    const btn = document.createElement('button');
+    btn.textContent = 'Undo';
+    btn.onclick = () => { dismissToast(); undoFn(); };
+    el.appendChild(btn);
+  }
+  document.body.appendChild(el);
+  requestAnimationFrame(() => el.classList.add('show'));
+  toastTimer = setTimeout(dismissToast, 5000);
+}
+function dismissToast() {
+  clearTimeout(toastTimer);
+  const el = document.querySelector('.toast');
+  if (el) el.remove();
+}
+
 // zoom is a view setting, not plan data — not persisted, resets each session
 let roomZoom = 1;
 const ZOOM_MIN = 0.4, ZOOM_MAX = 3;
@@ -98,8 +121,10 @@ document.addEventListener('drop', e => e.preventDefault());
 document.addEventListener('keydown', e => {
   const mod = e.ctrlKey || e.metaKey;
   if (mod && e.key.toLowerCase() === 'z' && !['INPUT', 'TEXTAREA'].includes(e.target.tagName)) { e.preventDefault(); undo(); }
+  else if (e.key === 'Escape' && document.getElementById('kbdOverlay')) { toggleKbdHelp(); }
   else if (e.key === 'Escape' && pairSelectId) { closeRelPicker(); }
   else if (e.key === 'Escape' && selectedGuestId) { selectedGuestId = null; renderAll(); }
+  else if (e.key === '?' && !['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName) && !e.target.isContentEditable) { toggleKbdHelp(); }
 });
 
 // ===== Guests =====
@@ -151,13 +176,21 @@ function renameGuest(id) {
 
 function deleteGuest(id) {
   const guest = guestById(id);
-  if (!confirm(`Remove ${guest.name} from the guest list? This clears their seat and any relationships involving them.`)) return;
+  const snapshot = JSON.stringify(state);
   if (openGroupPickerState && openGroupPickerState.guestId === id) closeGroupPicker();
   removeGuestFromAllSeats(id);
   state.rels = state.rels.filter(r => r.a !== id && r.b !== id);
   state.guests = state.guests.filter(g => g.id !== id);
   if (selectedGuestId === id) selectedGuestId = null;
   save(); renderAll();
+  showToast(`Removed ${guest.name}`, () => {
+    const restored = JSON.parse(snapshot);
+    state.guests = migrateGuestGroups(restored.guests || []);
+    state.groups = restored.groups || [];
+    state.rels = restored.rels || [];
+    state.tables = migrateTablePositions(restored.tables || []);
+    save(); renderAll();
+  });
 }
 
 // ===== Groups =====
@@ -314,7 +347,43 @@ function isDuplicateRel(a, b, type) {
   return state.rels.some(r => r.type === type && ((r.a === a && r.b === b) || (r.a === b && r.b === a)));
 }
 
-function deleteRel(id) { state.rels = state.rels.filter(r => r.id !== id); save(); renderAll(); }
+function bulkAddRels() {
+  const text = document.getElementById('relPasteArea').value;
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  if (!lines.length) return;
+  const nameIndex = new Map();
+  state.guests.forEach(g => nameIndex.set(g.name.toLowerCase(), g.id));
+  const typeAliases = { must: 'must', conflict: 'conflict', knows: 'knows', 'must not': 'conflict', mustnot: 'conflict' };
+  let added = 0, skipped = [];
+  lines.forEach((line, i) => {
+    const parts = line.split(/[,;\t]+/).map(s => s.trim());
+    if (parts.length < 2) { skipped.push(`Line ${i+1}: need at least two names`); return; }
+    const nameA = parts[0], nameB = parts[1];
+    const typeStr = (parts[2] || 'knows').toLowerCase();
+    const type = typeAliases[typeStr];
+    if (!type) { skipped.push(`Line ${i+1}: unknown type "${parts[2]}"`); return; }
+    const idA = nameIndex.get(nameA.toLowerCase()), idB = nameIndex.get(nameB.toLowerCase());
+    if (!idA) { skipped.push(`Line ${i+1}: "${nameA}" not found`); return; }
+    if (!idB) { skipped.push(`Line ${i+1}: "${nameB}" not found`); return; }
+    if (idA === idB) { skipped.push(`Line ${i+1}: same person`); return; }
+    if (isDuplicateRel(idA, idB, type)) { skipped.push(`Line ${i+1}: duplicate`); return; }
+    state.rels.push({ id: crypto.randomUUID(), a: idA, b: idB, type });
+    added++;
+  });
+  document.getElementById('relPasteArea').value = '';
+  save(); renderAll();
+  const msg = `Added ${added} relationship${added !== 1 ? 's' : ''}` + (skipped.length ? ` · ${skipped.length} skipped` : '');
+  showToast(msg);
+  if (skipped.length) console.warn('Bulk relationship import skipped lines:', skipped);
+}
+
+function deleteRel(id) {
+  const rel = state.rels.find(r => r.id === id);
+  const a = guestById(rel?.a), b = guestById(rel?.b);
+  state.rels = state.rels.filter(r => r.id !== id);
+  save(); renderAll();
+  if (a && b) showToast(`Removed ${a.name} — ${b.name} relationship`, () => { state.rels.push(rel); save(); renderAll(); });
+}
 
 let activeRelTab = 'all';
 function setRelTab(type) {
@@ -1006,6 +1075,37 @@ async function suggestBetterPlan() {
 
 // ===== Whole-plan reset / share =====
 
+// ===== Keyboard shortcut help =====
+
+function toggleKbdHelp() {
+  let overlay = document.getElementById('kbdOverlay');
+  if (overlay) { overlay.remove(); return; }
+  overlay = document.createElement('div');
+  overlay.id = 'kbdOverlay';
+  overlay.className = 'kbd-overlay';
+  overlay.innerHTML = `
+    <div class="kbd-panel">
+      <div class="kbd-header"><b>Keyboard shortcuts & interactions</b><button class="icon" onclick="toggleKbdHelp()">✕</button></div>
+      <div class="kbd-grid">
+        <div class="kbd-section">
+          <div class="kbd-title">Keyboard</div>
+          <div class="kbd-row"><kbd>Ctrl/⌘ Z</kbd><span>Undo last action</span></div>
+          <div class="kbd-row"><kbd>Escape</kbd><span>Cancel selection / close popover</span></div>
+          <div class="kbd-row"><kbd>Ctrl/⌘ Scroll</kbd><span>Zoom in/out on the room</span></div>
+        </div>
+        <div class="kbd-section">
+          <div class="kbd-title">Guest interactions</div>
+          <div class="kbd-row"><kbd>Click</kbd><span>Select guest, then click a seat to place</span></div>
+          <div class="kbd-row"><kbd>Double-click</kbd><span>Rename guest in place</span></div>
+          <div class="kbd-row"><kbd>Shift-click</kbd><span>Select two guests to add a relationship</span></div>
+          <div class="kbd-row"><kbd>Drag</kbd><span>Move guest to a seat or back to pool</span></div>
+        </div>
+      </div>
+    </div>`;
+  overlay.onclick = e => { if (e.target === overlay) toggleKbdHelp(); };
+  document.body.appendChild(overlay);
+}
+
 function resetAll() {
   if (!confirm('Clear all guests, groups, relationships and tables? This cannot be undone.')) return;
   state.guests = []; state.groups = []; state.rels = []; state.tables = [];
@@ -1083,9 +1183,18 @@ function arrangeTables() {
 function deleteTable(id) {
   const t = state.tables.find(t => t.id === id);
   const seatedCount = t.seats.filter(Boolean).length;
-  if (seatedCount && !confirm(`Remove ${t.name}? ${seatedCount} seated guest(s) will move back to Unseated.`)) return;
+  const snapshot = JSON.stringify(state);
   state.tables = state.tables.filter(t => t.id !== id);
   save(); renderAll();
+  const msg = seatedCount ? `Removed ${t.name} — ${seatedCount} guest(s) unseated` : `Removed ${t.name}`;
+  showToast(msg, () => {
+    const restored = JSON.parse(snapshot);
+    state.guests = migrateGuestGroups(restored.guests || []);
+    state.groups = restored.groups || [];
+    state.rels = restored.rels || [];
+    state.tables = migrateTablePositions(restored.tables || []);
+    save(); renderAll();
+  });
 }
 function setTableLinked(id, linked) {
   const t = state.tables.find(t => t.id === id);
