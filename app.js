@@ -273,9 +273,9 @@ function planScore() {
 function searchScore(s) {
   const tableOversize = state.tables.reduce((sum, t) => {
     const cap = tableCapacity(t);
-    return sum + (cap > 8 ? 0.05 * (cap - 8) * (cap - 8) : 0);
+    return sum + (cap > 8 ? 0.2 * (cap - 8) * (cap - 8) : 0);
   }, 0);
-  return (s.finalScore ?? -1) + 3 * s.seatedCount - 0.5 * s.emptySeats - 1.5 * s.tableCount - tableOversize;
+  return (s.finalScore ?? -1) + 3 * s.seatedCount - 0.5 * s.emptySeats - 1 * s.tableCount - tableOversize;
 }
 
 // Violation count is compared FIRST, strictly — not just folded into the point score. A flat point
@@ -385,7 +385,11 @@ function moveGrowTable() {
 function moveShrinkTable() {
   const candidates = state.tables.filter(t => t.linked > 1);
   if (!candidates.length) return null;
-  const t = candidates[Math.floor(Math.random() * candidates.length)];
+  const weights = candidates.map(t => t.linked);
+  const totalW = weights.reduce((a, b) => a + b, 0);
+  let pick = Math.random() * totalW;
+  let t = candidates[candidates.length - 1];
+  for (let i = 0; i < candidates.length; i++) { pick -= weights[i]; if (pick <= 0) { t = candidates[i]; break; } }
   const newCap = 2 * (t.linked - 1) + 2;
   const seated = t.seats.filter(Boolean);
   if (seated.length > newCap) return null; // would evict a seated guest — not allowed
@@ -447,7 +451,11 @@ function moveMergeTables() {
 function moveSplitTable() {
   const candidates = state.tables.filter(t => t.linked >= 2);
   if (!candidates.length) return null;
-  const t = candidates[Math.floor(Math.random() * candidates.length)];
+  const weights = candidates.map(t => t.linked * t.linked);
+  const totalW = weights.reduce((a, b) => a + b, 0);
+  let pick = Math.random() * totalW;
+  let t = candidates[candidates.length - 1];
+  for (let i = 0; i < candidates.length; i++) { pick -= weights[i]; if (pick <= 0) { t = candidates[i]; break; } }
   const seated = t.seats.filter(Boolean);
   // shuffle seated guests so the split is random each time
   for (let i = seated.length - 1; i > 0; i--) {
@@ -475,15 +483,42 @@ function moveSplitTable() {
   };
 }
 
+function moveEjectFromOversized() {
+  const big = state.tables.filter(t => tableCapacity(t) > 8 && t.seats.filter(Boolean).length > 6);
+  if (!big.length) return null;
+  const t = big.reduce((a, b) => tableCapacity(a) > tableCapacity(b) ? a : b);
+  const mustPartners = new Set();
+  state.rels.filter(r => r.type === 'must').forEach(r => {
+    if (t.seats.includes(r.a)) mustPartners.add(r.b);
+    if (t.seats.includes(r.b)) mustPartners.add(r.a);
+  });
+  const ejectCandidates = t.seats
+    .map((id, si) => [id, si])
+    .filter(([id]) => id && !mustPartners.has(id));
+  if (!ejectCandidates.length) return null;
+  const [guestId, srcSi] = ejectCandidates[Math.floor(Math.random() * ejectCandidates.length)];
+  const otherSlots = [];
+  state.tables.forEach((ot, ti) => {
+    if (ot === t) return;
+    ot.seats.forEach((v, si) => { if (!v) otherSlots.push([ti, si]); });
+  });
+  if (!otherSlots.length) return null;
+  const [dstTi, dstSi] = otherSlots[Math.floor(Math.random() * otherSlots.length)];
+  t.seats[srcSi] = null;
+  state.tables[dstTi].seats[dstSi] = guestId;
+  return () => { state.tables[dstTi].seats[dstSi] = null; t.seats[srcSi] = guestId; };
+}
+
 function randomMoveInPlace() {
   const r = Math.random();
-  if (r < 0.30) return moveSwap();
-  if (r < 0.52) return movePlaceUnseated();
-  if (r < 0.58) return moveGrowTable();
-  if (r < 0.68) return moveShrinkTable();
-  if (r < 0.74) return moveDeleteEmptyTable();
-  if (r < 0.80) return moveMergeTables();
-  if (r < 0.92) return moveSplitTable();
+  if (r < 0.25) return moveSwap();
+  if (r < 0.45) return movePlaceUnseated();
+  if (r < 0.50) return moveGrowTable();
+  if (r < 0.60) return moveShrinkTable();
+  if (r < 0.65) return moveDeleteEmptyTable();
+  if (r < 0.70) return moveMergeTables();
+  if (r < 0.82) return moveSplitTable();
+  if (r < 0.94) return moveEjectFromOversized();
   return moveAddTable();
 }
 
@@ -581,10 +616,46 @@ function runSeatingOptimizer() {
   greedySeatEveryone();
   const workingBaseline = cloneAllTables();
 
+  function makeSmallTableSeed() {
+    restoreAllTables(workingBaseline);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const t of state.tables) {
+        if (t.linked >= 2 && t.seats.filter(Boolean).length > 6) {
+          const seated = t.seats.filter(Boolean);
+          for (let i = seated.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [seated[i], seated[j]] = [seated[j], seated[i]];
+          }
+          const linkedA = Math.floor(t.linked / 2);
+          const linkedB = t.linked - linkedA;
+          const capA = 2 * linkedA + 2, capB = 2 * linkedB + 2;
+          const halfA = seated.slice(0, Math.min(seated.length, capA));
+          const halfB = seated.slice(halfA.length, halfA.length + Math.min(seated.length - halfA.length, capB));
+          if (halfA.length <= capA && halfB.length <= capB) {
+            const idx = state.tables.indexOf(t);
+            t.linked = linkedA;
+            t.seats = halfA.concat(Array(capA - halfA.length).fill(null));
+            state.tables.splice(idx + 1, 0, {
+              id: crypto.randomUUID(), name: t.name + 's', linked: linkedB,
+              seats: halfB.concat(Array(capB - halfB.length).fill(null)),
+              x: t.x + 20, y: t.y + 20,
+            });
+            changed = true;
+            break;
+          }
+        }
+      }
+    }
+    return cloneAllTables();
+  }
+  const smallSeed = makeSmallTableSeed();
+
   const RESTARTS = 12, ITERATIONS = 4000;
   let bestSnapshot = workingBaseline, bestScore = planScore();
   for (let r = 0; r < RESTARTS; r++) {
-    restoreAllTables(workingBaseline);
+    restoreAllTables(r % 2 === 0 ? workingBaseline : smallSeed);
     hillClimb(ITERATIONS);
     const candidateScore = planScore();
     if (isBetterPlan(candidateScore, bestScore)) { bestScore = candidateScore; bestSnapshot = cloneAllTables(); }
