@@ -17,17 +17,7 @@ A browser-based seating planner for weddings, dinners, conferences, and any even
 
 ## Getting started
 
-No build step or dependencies required. Open `index.html` in any modern browser:
-
-```sh
-# macOS
-open index.html
-
-# Linux
-xdg-open index.html
-
-# or simply double-click the file in your file manager
-```
+No build step or dependencies required — just open `index.html` in any modern browser.
 
 ## Workflow
 
