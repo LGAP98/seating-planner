@@ -232,7 +232,9 @@ function tableScoreDetail(table, knowsPairs) {
   const density = totalPairs ? connectedPairs / totalPairs : 0;
   const isolatedIds = seated.filter(id => connections.get(id) === 0);
   const isolationFree = (k - isolatedIds.length) / k;
-  return { k, isolatedIds, score: 0.6 * isolationFree + 0.4 * density };
+  const socialScore = 0.6 * isolationFree + 0.4 * density;
+  const conversationQ = k <= 8 ? 1 : Math.sqrt(8 / k);
+  return { k, isolatedIds, score: socialScore * conversationQ };
 }
 
 // returns null finalScore when nobody's seated yet — there's nothing meaningful to grade.
@@ -271,11 +273,13 @@ function planScore() {
 // pressure, or it happily scatters guests across a dozen sparse tables since nothing in finalScore
 // tells it not to (a set of near-empty tables can score just as "perfect" as two tidy ones).
 function searchScore(s) {
-  const tableOversize = state.tables.reduce((sum, t) => {
-    const cap = tableCapacity(t);
-    return sum + (cap > 8 ? 0.2 * (cap - 8) * (cap - 8) : 0);
-  }, 0);
-  return (s.finalScore ?? -1) + 3 * s.seatedCount - 0.5 * s.emptySeats - 1 * s.tableCount - tableOversize;
+  let tableSizePressure = 0;
+  state.tables.forEach(t => {
+    const seated = t.seats.filter(Boolean).length;
+    if (seated <= 8) tableSizePressure += 2;
+    else tableSizePressure -= 0.5 * (seated - 8) * (seated - 8);
+  });
+  return (s.finalScore ?? -1) + 3 * s.seatedCount - 0.5 * s.emptySeats - 0.5 * s.tableCount + tableSizePressure;
 }
 
 // Violation count is compared FIRST, strictly — not just folded into the point score. A flat point
@@ -512,12 +516,12 @@ function moveEjectFromOversized() {
 function randomMoveInPlace() {
   const r = Math.random();
   if (r < 0.25) return moveSwap();
-  if (r < 0.45) return movePlaceUnseated();
-  if (r < 0.50) return moveGrowTable();
-  if (r < 0.60) return moveShrinkTable();
-  if (r < 0.65) return moveDeleteEmptyTable();
-  if (r < 0.70) return moveMergeTables();
-  if (r < 0.82) return moveSplitTable();
+  if (r < 0.42) return movePlaceUnseated();
+  if (r < 0.45) return moveGrowTable();
+  if (r < 0.55) return moveShrinkTable();
+  if (r < 0.60) return moveDeleteEmptyTable();
+  if (r < 0.64) return moveMergeTables();
+  if (r < 0.78) return moveSplitTable();
   if (r < 0.94) return moveEjectFromOversized();
   return moveAddTable();
 }
@@ -622,7 +626,7 @@ function runSeatingOptimizer() {
     while (changed) {
       changed = false;
       for (const t of state.tables) {
-        if (t.linked >= 2 && t.seats.filter(Boolean).length > 6) {
+        if (t.linked >= 2 && t.seats.filter(Boolean).length > 4) {
           const seated = t.seats.filter(Boolean);
           for (let i = seated.length - 1; i > 0; i--) {
             const j = Math.floor(Math.random() * (i + 1));
@@ -655,7 +659,7 @@ function runSeatingOptimizer() {
   const RESTARTS = 12, ITERATIONS = 4000;
   let bestSnapshot = workingBaseline, bestScore = planScore();
   for (let r = 0; r < RESTARTS; r++) {
-    restoreAllTables(r % 2 === 0 ? workingBaseline : smallSeed);
+    restoreAllTables(r < 4 ? workingBaseline : smallSeed);
     hillClimb(ITERATIONS);
     const candidateScore = planScore();
     if (isBetterPlan(candidateScore, bestScore)) { bestScore = candidateScore; bestSnapshot = cloneAllTables(); }
@@ -697,7 +701,7 @@ const _highsReady = (async () => {
   } catch (e) { console.warn('HiGHS WASM unavailable:', e); }
 })();
 
-function milpConversationBonus(cap) { return 3 - 0.75 * (cap - 4); }
+function milpConversationBonus(cap) { return 4 - (cap - 4); }
 
 function buildMILPModel() {
   const N = state.guests.length;
