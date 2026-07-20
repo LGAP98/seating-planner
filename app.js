@@ -434,6 +434,41 @@ function moveMergeTables() {
   };
 }
 
+// inverse of merge: pull a table apart into two smaller ones, distributing seated guests
+// between them. Splitting a linked=1 table (4 seats) would produce two linked=1 tables (4+4),
+// so the minimum candidate is linked>=2. Guests are split roughly in half; the halves are
+// assigned randomly so the search can discover better social groupings via subsequent swaps.
+function moveSplitTable() {
+  const candidates = state.tables.filter(t => t.linked >= 2);
+  if (!candidates.length) return null;
+  const t = candidates[Math.floor(Math.random() * candidates.length)];
+  const seated = t.seats.filter(Boolean);
+  // shuffle seated guests so the split is random each time
+  for (let i = seated.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [seated[i], seated[j]] = [seated[j], seated[i]];
+  }
+  const linkedA = Math.floor(t.linked / 2);
+  const linkedB = t.linked - linkedA;
+  const capA = 2 * linkedA + 2, capB = 2 * linkedB + 2;
+  const halfA = seated.slice(0, Math.min(seated.length, capA));
+  const halfB = seated.slice(halfA.length, halfA.length + Math.min(seated.length - halfA.length, capB));
+  if (halfA.length > capA || halfB.length > capB) return null; // shouldn't happen, but guard
+
+  const oldLinked = t.linked, oldSeats = t.seats.slice();
+  const insertIdx = state.tables.indexOf(t) + 1;
+  t.linked = linkedA;
+  t.seats = halfA.concat(Array(capA - halfA.length).fill(null));
+  const newTable = { id: crypto.randomUUID(), name: t.name + 'b', linked: linkedB, seats: halfB.concat(Array(capB - halfB.length).fill(null)), x: t.x + 20, y: t.y + 20 };
+  state.tables.splice(insertIdx, 0, newTable);
+
+  return () => {
+    t.linked = oldLinked;
+    t.seats = oldSeats;
+    state.tables.splice(insertIdx, 1);
+  };
+}
+
 function randomMoveInPlace() {
   const r = Math.random();
   if (r < 0.35) return moveSwap();
@@ -441,7 +476,8 @@ function randomMoveInPlace() {
   if (r < 0.68) return moveGrowTable();
   if (r < 0.76) return moveShrinkTable();
   if (r < 0.82) return moveDeleteEmptyTable();
-  if (r < 0.94) return moveMergeTables(); // the direct path to "fewer, bigger tables"
+  if (r < 0.88) return moveMergeTables();
+  if (r < 0.94) return moveSplitTable(); // direct path to "fewer, smaller tables"
   return moveAddTable();
 }
 
