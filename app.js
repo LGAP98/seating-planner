@@ -233,8 +233,7 @@ function tableScoreDetail(table, knowsPairs) {
   const isolatedIds = seated.filter(id => connections.get(id) === 0);
   const isolationFree = (k - isolatedIds.length) / k;
   const socialScore = 0.6 * isolationFree + 0.4 * density;
-  const conversationQ = k <= 8 ? 1 : Math.sqrt(8 / k);
-  return { k, isolatedIds, score: socialScore * conversationQ };
+  return { k, isolatedIds, score: socialScore };
 }
 
 // returns null finalScore when nobody's seated yet — there's nothing meaningful to grade.
@@ -274,10 +273,17 @@ function planScore() {
 // tells it not to (a set of near-empty tables can score just as "perfect" as two tidy ones).
 function searchScore(s) {
   let tableSizePressure = 0;
+  const mustIds = new Set();
+  state.rels.filter(r => r.type === 'must').forEach(r => { mustIds.add(r.a); mustIds.add(r.b); });
   state.tables.forEach(t => {
-    const seated = t.seats.filter(Boolean).length;
-    if (seated <= 8) tableSizePressure += 2;
-    else tableSizePressure -= 0.5 * (seated - 8) * (seated - 8);
+    const seated = t.seats.filter(Boolean);
+    const k = seated.length;
+    if (k === 0) return;
+    const hasMust = seated.some(id => mustIds.has(id));
+    if (hasMust) return;
+    if (k <= 6) tableSizePressure += 4;
+    else if (k <= 8) tableSizePressure += 1;
+    else tableSizePressure -= (k - 6) * (k - 6);
   });
   return (s.finalScore ?? -1) + 3 * s.seatedCount - 0.5 * s.emptySeats - 0.5 * s.tableCount + tableSizePressure;
 }
@@ -556,7 +562,7 @@ function greedySeatEveryone() {
   // whole table to themselves. A cluster is never split across bins, so "must" pairs stay intact;
   // the stochastic search then only has to polish this for social fit (and split it back up if a
   // packed-together bin scores badly), not discover the consolidation from scratch.
-  const greedyCap = 10;
+  const greedyCap = 6;
   const hardMaxCap = 2 * MAX_LINKED + 2;
   const bins = [];
   [...byCluster.values()].sort((a, b) => b.length - a.length).forEach(cluster => {
@@ -599,7 +605,7 @@ function hillClimb(iterations) {
     const newPlan = planScore();
     const newScore = searchScore(newPlan);
     const delta = newScore - currentScore;
-    const temperature = 30 * (1 - i / iterations) + 0.5;
+    const temperature = 80 * (1 - i / iterations) + 0.5;
     if (delta >= 0 || Math.random() < Math.exp(delta / temperature)) {
       currentScore = newScore;
       if (isBetterPlan(newPlan, bestPlan)) { bestPlan = newPlan; bestSnapshot = cloneAllTables(); }
@@ -656,10 +662,10 @@ function runSeatingOptimizer() {
   }
   const smallSeed = makeSmallTableSeed();
 
-  const RESTARTS = 12, ITERATIONS = 4000;
+  const RESTARTS = 12, ITERATIONS = 6000;
   let bestSnapshot = workingBaseline, bestScore = planScore();
   for (let r = 0; r < RESTARTS; r++) {
-    restoreAllTables(r < 4 ? workingBaseline : smallSeed);
+    restoreAllTables(r < 2 ? workingBaseline : smallSeed);
     hillClimb(ITERATIONS);
     const candidateScore = planScore();
     if (isBetterPlan(candidateScore, bestScore)) { bestScore = candidateScore; bestSnapshot = cloneAllTables(); }
@@ -701,7 +707,7 @@ const _highsReady = (async () => {
   } catch (e) { console.warn('HiGHS WASM unavailable:', e); }
 })();
 
-function milpConversationBonus(cap) { return 4 - (cap - 4); }
+function milpConversationBonus(cap) { return cap <= 6 ? 3 : cap <= 8 ? 1 : 0; }
 
 function buildMILPModel() {
   const N = state.guests.length;
