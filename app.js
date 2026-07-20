@@ -434,6 +434,41 @@ function moveMergeTables() {
   };
 }
 
+// inverse of merge: pull a table apart into two smaller ones, distributing seated guests
+// between them. Splitting a linked=1 table (4 seats) would produce two linked=1 tables (4+4),
+// so the minimum candidate is linked>=2. Guests are split roughly in half; the halves are
+// assigned randomly so the search can discover better social groupings via subsequent swaps.
+function moveSplitTable() {
+  const candidates = state.tables.filter(t => t.linked >= 2);
+  if (!candidates.length) return null;
+  const t = candidates[Math.floor(Math.random() * candidates.length)];
+  const seated = t.seats.filter(Boolean);
+  // shuffle seated guests so the split is random each time
+  for (let i = seated.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [seated[i], seated[j]] = [seated[j], seated[i]];
+  }
+  const linkedA = Math.floor(t.linked / 2);
+  const linkedB = t.linked - linkedA;
+  const capA = 2 * linkedA + 2, capB = 2 * linkedB + 2;
+  const halfA = seated.slice(0, Math.min(seated.length, capA));
+  const halfB = seated.slice(halfA.length, halfA.length + Math.min(seated.length - halfA.length, capB));
+  if (halfA.length > capA || halfB.length > capB) return null; // shouldn't happen, but guard
+
+  const oldLinked = t.linked, oldSeats = t.seats.slice();
+  const insertIdx = state.tables.indexOf(t) + 1;
+  t.linked = linkedA;
+  t.seats = halfA.concat(Array(capA - halfA.length).fill(null));
+  const newTable = { id: crypto.randomUUID(), name: t.name + 'b', linked: linkedB, seats: halfB.concat(Array(capB - halfB.length).fill(null)), x: t.x + 20, y: t.y + 20 };
+  state.tables.splice(insertIdx, 0, newTable);
+
+  return () => {
+    t.linked = oldLinked;
+    t.seats = oldSeats;
+    state.tables.splice(insertIdx, 1);
+  };
+}
+
 function randomMoveInPlace() {
   const r = Math.random();
   if (r < 0.35) return moveSwap();
@@ -441,7 +476,8 @@ function randomMoveInPlace() {
   if (r < 0.68) return moveGrowTable();
   if (r < 0.76) return moveShrinkTable();
   if (r < 0.82) return moveDeleteEmptyTable();
-  if (r < 0.94) return moveMergeTables(); // the direct path to "fewer, bigger tables"
+  if (r < 0.88) return moveMergeTables();
+  if (r < 0.94) return moveSplitTable(); // direct path to "fewer, smaller tables"
   return moveAddTable();
 }
 
@@ -569,13 +605,197 @@ function runSeatingOptimizer() {
   save(); renderAll();
 }
 
-function suggestBetterPlan() {
+// ===== MILP Optimizer (client-side, HiGHS WASM) =====
+// Formulates guest-to-table assignment as a mixed-integer linear program and solves it
+// optimally. Generates candidate tables biased toward smaller sizes (better for conversation)
+// and lets the solver pick which to activate and who sits where.
+
+let _highsSolver = null;
+const _highsReady = (async () => {
+  try {
+    const m = await import('https://cdn.jsdelivr.net/npm/highs/+esm');
+    _highsSolver = await m.default();
+  } catch (e) { console.warn('HiGHS WASM unavailable:', e); }
+})();
+
+function milpConversationBonus(cap) { return Math.max(0, 3 - 0.75 * (cap - 4)); }
+
+function buildMILPModel() {
+  const N = state.guests.length;
+  if (!N) return null;
+  const guestIds = state.guests.map(g => g.id);
+  const gIdx = new Map(guestIds.map((id, i) => [id, i]));
+
+  const knowsIdx = buildKnowsIndex();
+  const knowsPairs = [];
+  for (let i = 0; i < N; i++)
+    for (let j = i + 1; j < N; j++)
+      if (knowEachOther(guestIds[i], guestIds[j], knowsIdx))
+        knowsPairs.push([i, j]);
+
+  const mustPairs = state.rels.filter(r => r.type === 'must')
+    .map(r => [gIdx.get(r.a), gIdx.get(r.b)])
+    .filter(([a, b]) => a != null && b != null);
+
+  const conflictPairs = state.rels.filter(r => r.type === 'conflict')
+    .map(r => [gIdx.get(r.a), gIdx.get(r.b)])
+    .filter(([a, b]) => a != null && b != null);
+
+  // union-find for must-clusters to determine minimum table size
+  const par = Array.from({ length: N }, (_, i) => i);
+  function find(x) { return par[x] === x ? x : (par[x] = find(par[x])); }
+  mustPairs.forEach(([a, b]) => { par[find(a)] = find(b); });
+  let maxCluster = 1;
+  const csz = new Map();
+  for (let i = 0; i < N; i++) { const r = find(i); csz.set(r, (csz.get(r) || 0) + 1); }
+  csz.forEach(v => { if (v > maxCluster) maxCluster = v; });
+
+  const sizes = [{ linked: 1, cap: 4 }];
+  if (N > 4 || maxCluster > 4) sizes.push({ linked: 2, cap: 6 });
+  if (N > 12 || maxCluster > 6) sizes.push({ linked: 3, cap: 8 });
+  if (maxCluster > 8) { const lk = Math.ceil((maxCluster - 2) / 2); sizes.push({ linked: lk, cap: 2 * lk + 2 }); }
+
+  const candidates = [];
+  sizes.forEach(s => {
+    const count = Math.ceil(N / s.cap) + 1;
+    for (let k = 0; k < count; k++) candidates.push({ ...s });
+  });
+  const T = candidates.length;
+
+  // --- build LP string ---
+  const obj = [];
+
+  knowsPairs.forEach((_, k) => { for (let t = 0; t < T; t++) obj.push(`p${k}t${t}`); });
+  for (let i = 0; i < N; i++) obj.push(`5 w${i}`);
+  for (let i = 0; i < N; i++)
+    for (let t = 0; t < T; t++) {
+      const b = milpConversationBonus(candidates[t].cap);
+      if (b > 0) obj.push(`${b} g${i}t${t}`);
+    }
+  candidates.forEach((c, t) => obj.push(`- ${1 + 0.1 * c.cap} u${t}`));
+
+  let lp = 'Maximize\n obj: ' + (obj.length ? obj.join(' + ').replace(/\+ - /g, '- ') : '0') + '\n';
+  lp += 'Subject To\n';
+
+  for (let i = 0; i < N; i++) {
+    const ts = []; for (let t = 0; t < T; t++) ts.push(`g${i}t${t}`);
+    lp += ` a${i}: ${ts.join(' + ')} = 1\n`;
+  }
+  candidates.forEach((c, t) => {
+    const ts = []; for (let i = 0; i < N; i++) ts.push(`g${i}t${t}`);
+    lp += ` cp${t}: ${ts.join(' + ')} - ${c.cap} u${t} <= 0\n`;
+  });
+  mustPairs.forEach(([a, b], m) => {
+    for (let t = 0; t < T; t++) lp += ` m${m}t${t}: g${a}t${t} - g${b}t${t} = 0\n`;
+  });
+  conflictPairs.forEach(([a, b], ci) => {
+    for (let t = 0; t < T; t++) lp += ` cf${ci}t${t}: g${a}t${t} + g${b}t${t} <= 1\n`;
+  });
+  knowsPairs.forEach(([i, j], k) => {
+    for (let t = 0; t < T; t++) {
+      lp += ` ya${k}t${t}: p${k}t${t} - g${i}t${t} <= 0\n`;
+      lp += ` yb${k}t${t}: p${k}t${t} - g${j}t${t} <= 0\n`;
+    }
+  });
+  for (let i = 0; i < N; i++) {
+    const yts = [];
+    knowsPairs.forEach(([a, b], k) => {
+      if (a === i || b === i) for (let t = 0; t < T; t++) yts.push(`p${k}t${t}`);
+    });
+    lp += yts.length ? ` wb${i}: w${i} - ${yts.join(' - ')} <= 0\n` : ` wb${i}: w${i} <= 0\n`;
+  }
+
+  lp += 'Bounds\n';
+  knowsPairs.forEach((_, k) => { for (let t = 0; t < T; t++) lp += ` 0 <= p${k}t${t} <= 1\n`; });
+  for (let i = 0; i < N; i++) lp += ` 0 <= w${i} <= 1\n`;
+
+  lp += 'Binary\n';
+  const bins = [];
+  for (let i = 0; i < N; i++) for (let t = 0; t < T; t++) bins.push(`g${i}t${t}`);
+  candidates.forEach((_, t) => bins.push(`u${t}`));
+  lp += ' ' + bins.join(' ') + '\n';
+  lp += 'End\n';
+
+  return { lp, candidates, guestIds };
+}
+
+function applyMILPSolution(result, candidates, guestIds) {
+  const newTables = [];
+  candidates.forEach((c, t) => {
+    if ((result.Columns[`u${t}`]?.Primal ?? 0) < 0.5) return;
+    const seated = [];
+    guestIds.forEach((gid, i) => {
+      if ((result.Columns[`g${i}t${t}`]?.Primal ?? 0) > 0.5) seated.push(gid);
+    });
+    if (!seated.length) return;
+    const linked = Math.max(1, Math.ceil((seated.length - 2) / 2));
+    const cap = 2 * linked + 2;
+    newTables.push({
+      id: crypto.randomUUID(), name: `Table ${newTables.length + 1}`,
+      linked, seats: seated.concat(Array(Math.max(0, cap - seated.length)).fill(null)),
+      x: 40, y: 40,
+    });
+  });
+  newTables.forEach((t, i) => {
+    const fp = tableFootprint(t.linked);
+    t.x = 40 + (i % 4) * (fp.width + 40);
+    t.y = 40 + Math.floor(i / 4) * (fp.height + 50);
+  });
+  return newTables;
+}
+
+async function runMILP() {
+  const solver = _highsSolver || (await _highsReady, _highsSolver);
+  if (!solver) throw new Error('MILP solver unavailable (no network?)');
+  const model = buildMILPModel();
+  if (!model) throw new Error('No guests');
+  const result = solver.solve(model.lp);
+  if (result.Status !== 'Optimal') throw new Error('Solver: ' + result.Status);
+  return applyMILPSolution(result, model.candidates, model.guestIds);
+}
+
+async function suggestBetterPlan() {
+  if (!state.guests.length) { alert('Add some guests first — there\'s nothing to seat yet.'); return; }
   const btn = document.getElementById('optimizeBtn');
-  btn.disabled = true; btn.textContent = 'Optimizing…';
-  setTimeout(() => {
-    try { runSeatingOptimizer(); }
-    finally { btn.disabled = false; btn.textContent = '✨ Suggest better plan'; }
-  }, 20);
+  btn.disabled = true;
+  try {
+    let milpHandled = false;
+    try {
+      btn.textContent = 'Loading solver…';
+      const milpTables = await runMILP();
+      btn.textContent = 'Evaluating…';
+      const snap = cloneAllTables();
+      const oldScore = planScore();
+      state.tables.length = 0;
+      milpTables.forEach(t => state.tables.push(t));
+      const newScore = planScore();
+      restoreAllTables(snap);
+      if (isBetterPlan(newScore, oldScore)) {
+        const from = oldScore.finalScore === null ? 'no plan yet' : oldScore.finalScore;
+        const extras = [];
+        if (milpTables.length !== snap.length) extras.push(`${milpTables.length} table${milpTables.length !== 1 ? 's' : ''} instead of ${snap.length}`);
+        if (newScore.mustViolations + newScore.conflictViolations < oldScore.mustViolations + oldScore.conflictViolations) extras.push('resolves constraint violations');
+        const msg = `MILP optimizer found a better arrangement: ${from} → ${newScore.finalScore}/100`
+          + (extras.length ? ` (${extras.join(', ')})` : '')
+          + `.\n\nApply? (You can Undo afterward.)`;
+        if (confirm(msg)) {
+          state.tables.length = 0;
+          milpTables.forEach(t => state.tables.push(t));
+          save(); renderAll();
+        }
+        milpHandled = true;
+      }
+    } catch (e) { console.warn('MILP:', e.message); }
+
+    if (!milpHandled) {
+      btn.textContent = 'Optimizing…';
+      await new Promise(r => setTimeout(r, 20));
+      runSeatingOptimizer();
+    }
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '✨ Suggest better plan';
+  }
 }
 
 // ===== Whole-plan reset / share =====
