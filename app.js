@@ -1,0 +1,1066 @@
+// ===== State & persistence =====
+
+const state = JSON.parse(localStorage.getItem('seating') || 'null') || { guests: [], groups: [], rels: [], tables: [] };
+
+// old format had a single nullable `group` id; now a guest can belong to several groups
+function migrateGuestGroups(guests) {
+  guests.forEach(g => { if (!Array.isArray(g.groups)) g.groups = g.group ? [g.group] : []; delete g.group; });
+  return guests;
+}
+// default cascading positions for tables loaded (or migrated) without a saved x/y
+function migrateTablePositions(tables) {
+  tables.forEach((t, i) => { if (t.x == null) t.x = 30 + (i % 4) * 260; if (t.y == null) t.y = 30 + Math.floor(i / 4) * 240; });
+  return tables;
+}
+migrateTablePositions(state.tables);
+migrateGuestGroups(state.guests);
+
+// one level of undo: every save() call happens right after some function has already mutated
+// `state` in place, so localStorage still holds the *previous* value the instant we read it here —
+// stash that as the single undo step before overwriting it.
+let undoSnapshot = null;
+function save() {
+  const prev = localStorage.getItem('seating');
+  if (prev) undoSnapshot = prev;
+  localStorage.setItem('seating', JSON.stringify(state));
+}
+function undo() {
+  if (!undoSnapshot) return;
+  const restored = JSON.parse(undoSnapshot);
+  state.guests = migrateGuestGroups(restored.guests || []);
+  state.groups = restored.groups || [];
+  state.rels = restored.rels || [];
+  state.tables = migrateTablePositions(restored.tables || []);
+  localStorage.setItem('seating', undoSnapshot);
+  undoSnapshot = null; // single level — no undoing the undo
+  closeGroupPicker();
+  selectedGuestId = null;
+  renderAll();
+}
+
+function guestById(id) { return state.guests.find(g => g.id === id); }
+function groupById(id) { return state.groups.find(g => g.id === id); }
+function seatedTableOf(guestId) { return state.tables.find(t => t.seats.includes(guestId)); }
+
+// zoom is a view setting, not plan data — not persisted, resets each session
+let roomZoom = 1;
+const ZOOM_MIN = 0.4, ZOOM_MAX = 3;
+// below this pixel width a seat shows an initials avatar (name on hover) instead of the full name —
+// zooming in grows seats past this and the full name just appears
+const SEAT_LEGIBLE_PX = 56;
+
+// click-to-place: an alternative to drag-and-drop — click a guest, then click a seat (or the
+// empty pool background to unseat). Transient UI state, not persisted.
+let selectedGuestId = null;
+function toggleSelectGuest(id) { selectedGuestId = (selectedGuestId === id) ? null : id; renderAll(); }
+function trySeatSelected(tableId, seatIndex) {
+  if (!selectedGuestId) return;
+  placeGuest(selectedGuestId, tableId, seatIndex);
+  selectedGuestId = null;
+}
+function unseatSelected() {
+  if (!selectedGuestId) return;
+  removeGuestFromAllSeats(selectedGuestId);
+  selectedGuestId = null;
+  save(); renderAll();
+}
+
+// safety net: a guest chip dropped anywhere other than a seat/pool must not leak its id into a text field
+document.addEventListener('dragover', e => e.preventDefault());
+document.addEventListener('drop', e => e.preventDefault());
+
+document.addEventListener('keydown', e => {
+  const mod = e.ctrlKey || e.metaKey;
+  if (mod && e.key.toLowerCase() === 'z' && !['INPUT', 'TEXTAREA'].includes(e.target.tagName)) { e.preventDefault(); undo(); }
+  else if (e.key === 'Escape' && selectedGuestId) { selectedGuestId = null; renderAll(); }
+});
+
+// ===== Guests =====
+
+function addGuests() {
+  const names = document.getElementById('guestPaste').value.split('\n').map(s => s.trim()).filter(Boolean);
+  if (!names.length) return;
+
+  // warn on duplicates (against existing guests and within the pasted batch itself) —
+  // doesn't block adding them, since two genuine namesakes are a real possibility
+  const existing = new Set(state.guests.map(g => g.name.toLowerCase()));
+  const seenInBatch = new Set();
+  const dupes = new Set();
+  names.forEach(name => {
+    const key = name.toLowerCase();
+    if (existing.has(key) || seenInBatch.has(key)) dupes.add(name);
+    seenInBatch.add(key);
+  });
+
+  names.forEach(name => state.guests.push({ id: crypto.randomUUID(), name, groups: [] }));
+  document.getElementById('guestPaste').value = '';
+  save(); renderAll();
+
+  if (dupes.size) alert(`Heads up — these names already appear more than once:\n${[...dupes].join(', ')}\n\nThey were still added. Rename or remove one if that wasn't intentional.`);
+}
+
+function renameGuest(id) {
+  const guest = guestById(id);
+  const name = prompt('Rename guest', guest.name);
+  if (!name || !name.trim()) return;
+  guest.name = name.trim();
+  save(); renderAll();
+}
+
+function deleteGuest(id) {
+  const guest = guestById(id);
+  if (!confirm(`Remove ${guest.name} from the guest list? This clears their seat and any relationships involving them.`)) return;
+  if (openGroupPickerState && openGroupPickerState.guestId === id) closeGroupPicker();
+  removeGuestFromAllSeats(id);
+  state.rels = state.rels.filter(r => r.a !== id && r.b !== id);
+  state.guests = state.guests.filter(g => g.id !== id);
+  if (selectedGuestId === id) selectedGuestId = null;
+  save(); renderAll();
+}
+
+// ===== Groups =====
+
+function addGroup() {
+  const name = document.getElementById('groupName').value.trim();
+  if (!name) return;
+  state.groups.push({ id: crypto.randomUUID(), name, color: document.getElementById('groupColor').value });
+  document.getElementById('groupName').value = '';
+  save(); renderAll();
+}
+function deleteGroup(id) {
+  state.groups = state.groups.filter(g => g.id !== id);
+  state.guests.forEach(g => { g.groups = g.groups.filter(gid => gid !== id); });
+  save(); renderAll();
+}
+
+// small popover for toggling a guest's group membership (checkboxes, not a single-select) —
+// works the same whether the guest is unseated in the pool or already seated at a table
+let openGroupPickerState = null;
+function closeGroupPicker() {
+  if (!openGroupPickerState) return;
+  openGroupPickerState.panel.remove();
+  document.removeEventListener('mousedown', openGroupPickerState.onOutside, true);
+  openGroupPickerState = null;
+  renderAll();
+}
+function openGroupPicker(guestId, anchorEl) {
+  if (openGroupPickerState && openGroupPickerState.guestId === guestId) { closeGroupPicker(); return; }
+  closeGroupPicker();
+  const guest = guestById(guestId);
+  const panel = document.createElement('div');
+  panel.className = 'group-picker';
+  panel.innerHTML = state.groups.length
+    ? state.groups.map(g => `<label><input type="checkbox" value="${g.id}" ${guest.groups.includes(g.id) ? 'checked' : ''}><span class="dot" style="background:${g.color}"></span>${g.name}</label>`).join('')
+    : `<div class="empty">No groups yet — add one in the sidebar first.</div>`;
+  panel.querySelectorAll('input[type=checkbox]').forEach(cb => {
+    cb.onchange = () => {
+      const set = new Set(guest.groups);
+      cb.checked ? set.add(cb.value) : set.delete(cb.value);
+      guest.groups = [...set];
+      save();
+    };
+  });
+  document.body.appendChild(panel);
+  const rect = anchorEl.getBoundingClientRect();
+  const panelWidth = panel.offsetWidth;
+  const left = Math.max(8, Math.min(rect.left, window.innerWidth - panelWidth - 8));
+  panel.style.left = left + 'px';
+  panel.style.top = (rect.bottom + 4) + 'px';
+  const onOutside = e => { if (!panel.contains(e.target) && !anchorEl.contains(e.target)) closeGroupPicker(); };
+  setTimeout(() => document.addEventListener('mousedown', onOutside, true), 0);
+  openGroupPickerState = { panel, onOutside, guestId };
+}
+
+// ===== Relationships =====
+
+function addRel() {
+  const a = document.getElementById('relA').value, b = document.getElementById('relB').value;
+  if (!a || !b || a === b) return;
+  state.rels.push({ id: crypto.randomUUID(), a, b, type: document.getElementById('relType').value });
+  save(); renderAll();
+}
+function deleteRel(id) { state.rels = state.rels.filter(r => r.id !== id); save(); renderAll(); }
+
+function unmetMustPairs() {
+  return state.rels.filter(r => r.type === 'must').filter(r => {
+    const ta = seatedTableOf(r.a), tb = seatedTableOf(r.b);
+    return !ta || !tb || ta.id !== tb.id;
+  });
+}
+// "must NOT sit together" pairs that are currently violated (both seated at the same table)
+function brokenConflictPairs() {
+  return state.rels.filter(r => r.type === 'conflict').filter(r => {
+    const ta = seatedTableOf(r.a), tb = seatedTableOf(r.b);
+    return ta && tb && ta.id === tb.id;
+  });
+}
+
+// ===== Plan scoring =====
+// "know each other" = share a group, OR have an explicit knows/must relationship.
+// (conflict relationships never count as a connection — they're a pure penalty, handled separately.)
+
+function pairKey(a, b) { return a < b ? a + '|' + b : b + '|' + a; }
+function buildKnowsIndex() {
+  const pairs = new Set();
+  state.rels.forEach(r => { if (r.type === 'knows' || r.type === 'must') pairs.add(pairKey(r.a, r.b)); });
+  return pairs;
+}
+function knowEachOther(aId, bId, knowsPairs) {
+  const a = guestById(aId), b = guestById(bId);
+  if (a.groups.some(g => b.groups.includes(g))) return true;
+  return knowsPairs.has(pairKey(aId, bId));
+}
+
+// per-table: blend "nobody sits knowing zero people here" (weighted higher) with overall
+// pairwise density — see the write-up for why isolation matters more than raw density.
+function tableScoreDetail(table, knowsPairs) {
+  const seated = table.seats.filter(Boolean);
+  const k = seated.length;
+  if (k === 0) return null;
+  const connections = new Map(seated.map(id => [id, 0]));
+  let connectedPairs = 0;
+  for (let i = 0; i < k; i++) {
+    for (let j = i + 1; j < k; j++) {
+      if (knowEachOther(seated[i], seated[j], knowsPairs)) {
+        connectedPairs++;
+        connections.set(seated[i], connections.get(seated[i]) + 1);
+        connections.set(seated[j], connections.get(seated[j]) + 1);
+      }
+    }
+  }
+  const totalPairs = k * (k - 1) / 2;
+  const density = totalPairs ? connectedPairs / totalPairs : 0;
+  const isolatedIds = seated.filter(id => connections.get(id) === 0);
+  const isolationFree = (k - isolatedIds.length) / k;
+  return { k, isolatedIds, score: 0.6 * isolationFree + 0.4 * density };
+}
+
+// returns null finalScore when nobody's seated yet — there's nothing meaningful to grade.
+function planScore() {
+  const knowsPairs = buildKnowsIndex();
+  const details = state.tables
+    .map(t => ({ table: t, detail: tableScoreDetail(t, knowsPairs) }))
+    .filter(d => d.detail);
+
+  const seatedCount = details.reduce((sum, d) => sum + d.detail.k, 0);
+  const tableCount = state.tables.length;
+  const emptySeats = state.tables.reduce((sum, t) => sum + tableCapacity(t), 0) - seatedCount;
+
+  if (!seatedCount) {
+    return { finalScore: null, mustViolations: unmetMustPairs().length, conflictViolations: brokenConflictPairs().length, worstTable: null, isolatedGuestIds: [], seatedCount: 0, totalGuests: state.guests.length, tableCount, emptySeats };
+  }
+
+  const guestWeightedMean = details.reduce((sum, d) => sum + d.detail.score * d.detail.k, 0) / seatedCount;
+  const worst = details.reduce((min, d) => (!min || d.detail.score < min.score) ? { id: d.table.id, name: d.table.name, score: d.detail.score } : min, null);
+  const softScore = 0.75 * guestWeightedMean + 0.25 * worst.score;
+
+  const mustViolations = unmetMustPairs().length;
+  const conflictViolations = brokenConflictPairs().length;
+  const finalScore = Math.max(0, Math.min(100, Math.round(softScore * 100 - 30 * (mustViolations + conflictViolations))));
+
+  return {
+    finalScore, mustViolations, conflictViolations, worstTable: worst,
+    isolatedGuestIds: details.flatMap(d => d.detail.isolatedIds),
+    seatedCount, totalGuests: state.guests.length, tableCount, emptySeats,
+  };
+}
+
+// Table efficiency (few empty seats, no pointless extra tables) is deliberately NOT part of the
+// displayed finalScore — it's a logistics concern, not a social one, and a user who leaves
+// deliberate breathing room shouldn't see their score drop for it. But the OPTIMIZER needs this
+// pressure, or it happily scatters guests across a dozen sparse tables since nothing in finalScore
+// tells it not to (a set of near-empty tables can score just as "perfect" as two tidy ones).
+function searchScore(s) { return (s.finalScore ?? -1) + 3 * s.seatedCount - 0.5 * s.emptySeats - 3 * s.tableCount; }
+
+// Violation count is compared FIRST, strictly — not just folded into the point score. A flat point
+// penalty alone can't guarantee "hard constraints dominate" (a small/tightly-packed table can make
+// resolving one violation cost more density points than the penalty saves), so the optimizer must
+// never be talked into leaving a fixable "must"/"conflict" violation in place for a density gain.
+// searchScore (finalScore + parsimony) is the tiebreaker, so equally-constraint-clean plans prefer
+// the denser, tidier one — not just the one with the highest raw social-quality number.
+function isBetterPlan(a, b) {
+  const aViol = a.mustViolations + a.conflictViolations, bViol = b.mustViolations + b.conflictViolations;
+  if (aViol !== bViol) return aViol < bViol;
+  const aScore = searchScore(a), bScore = searchScore(b);
+  if (aScore !== bScore) return aScore > bScore;
+  return a.seatedCount > b.seatedCount;
+}
+
+let scorePanelEl = null;
+function closeScorePanel() {
+  if (!scorePanelEl) return;
+  scorePanelEl.remove();
+  document.removeEventListener('mousedown', onScorePanelOutside, true);
+  scorePanelEl = null;
+}
+function onScorePanelOutside(e) {
+  const btn = document.getElementById('scoreBadge');
+  if (scorePanelEl && !scorePanelEl.contains(e.target) && e.target !== btn) closeScorePanel();
+}
+function toggleScorePanel() {
+  if (scorePanelEl) { closeScorePanel(); return; }
+  const btn = document.getElementById('scoreBadge');
+  const s = planScore();
+  const panel = document.createElement('div');
+  panel.className = 'score-panel';
+  if (s.finalScore === null) {
+    panel.innerHTML = `<div class="empty">Seat a few guests to see a plan score.</div>`;
+  } else {
+    const isolatedNames = s.isolatedGuestIds.map(id => guestById(id)?.name).filter(Boolean);
+    panel.innerHTML = `
+      <div class="score-row"><b>${s.finalScore}/100</b></div>
+      <div class="score-row">${s.seatedCount}/${s.totalGuests} guests seated</div>
+      ${s.mustViolations ? `<div class="score-row warnrow">⚠ ${s.mustViolations} "must sit together" pair(s) not together</div>` : ''}
+      ${s.conflictViolations ? `<div class="score-row warnrow">⛔ ${s.conflictViolations} "must NOT sit together" pair(s) seated together</div>` : ''}
+      ${isolatedNames.length ? `<div class="score-row">Sitting with nobody they know: ${isolatedNames.join(', ')}</div>` : ''}
+      ${s.worstTable ? `<div class="score-row">Lowest-scoring table: ${s.worstTable.name} (${Math.round(s.worstTable.score * 100)}/100)</div>` : ''}
+    `;
+  }
+  document.body.appendChild(panel);
+  const rect = btn.getBoundingClientRect();
+  const left = Math.max(8, Math.min(rect.left, window.innerWidth - panel.offsetWidth - 8));
+  panel.style.left = left + 'px';
+  panel.style.top = (rect.bottom + 4) + 'px';
+  setTimeout(() => document.addEventListener('mousedown', onScorePanelOutside, true), 0);
+  scorePanelEl = panel;
+}
+
+// ===== Plan optimizer =====
+// Randomized hill-climbing over BOTH who-sits-where and the table structure itself: swap two seated
+// guests, drop an unseated guest into an empty seat, grow/shrink a table's "linked" count, delete an
+// empty table, or add a new one. That last set matters because the best structure might not be the
+// one you started with — three tables of 4 can score worse than two tables of 6 even with the exact
+// same guests, since fewer/bigger tables mean fewer isolated "odd one out" seats.
+// Never ejects an already-seated guest to unseated — a "better plan" shouldn't undo the user's
+// explicit placements, only rearrange around them, resize around them, and fill gaps.
+
+function cloneAllTables() { return state.tables.map(t => ({ ...t, seats: t.seats.slice() })); }
+function restoreAllTables(snapshot) {
+  state.tables.length = 0;
+  snapshot.forEach(t => state.tables.push({ ...t, seats: t.seats.slice() }));
+}
+
+const MAX_LINKED = 12; // generous cap (26 seats) just to keep random growth from running away
+
+function moveSwap() {
+  const slots = [];
+  state.tables.forEach((t, ti) => t.seats.forEach((_, si) => slots.push([ti, si])));
+  if (!slots.length) return null;
+  const [ti1, si1] = slots[Math.floor(Math.random() * slots.length)];
+  const [ti2, si2] = slots[Math.floor(Math.random() * slots.length)];
+  const a = state.tables[ti1].seats[si1], b = state.tables[ti2].seats[si2];
+  state.tables[ti1].seats[si1] = b;
+  state.tables[ti2].seats[si2] = a;
+  return () => { state.tables[ti1].seats[si1] = a; state.tables[ti2].seats[si2] = b; };
+}
+
+function movePlaceUnseated() {
+  const seatedIds = new Set(state.tables.flatMap(t => t.seats.filter(Boolean)));
+  const unseated = state.guests.map(g => g.id).filter(id => !seatedIds.has(id));
+  const emptySlots = [];
+  state.tables.forEach((t, ti) => t.seats.forEach((v, si) => { if (!v) emptySlots.push([ti, si]); }));
+  if (!unseated.length || !emptySlots.length) return null;
+  const guestId = unseated[Math.floor(Math.random() * unseated.length)];
+  const [ti, si] = emptySlots[Math.floor(Math.random() * emptySlots.length)];
+  state.tables[ti].seats[si] = guestId;
+  return () => { state.tables[ti].seats[si] = null; };
+}
+
+function moveGrowTable() {
+  if (!state.tables.length) return null;
+  const t = state.tables[Math.floor(Math.random() * state.tables.length)];
+  if (t.linked >= MAX_LINKED) return null;
+  const oldLinked = t.linked, oldSeats = t.seats.slice();
+  t.linked += 1;
+  t.seats = oldSeats.concat([null, null]); // +1 linked table = +2 seats (one more on each long side)
+  return () => { t.linked = oldLinked; t.seats = oldSeats; };
+}
+
+function moveShrinkTable() {
+  const candidates = state.tables.filter(t => t.linked > 1);
+  if (!candidates.length) return null;
+  const t = candidates[Math.floor(Math.random() * candidates.length)];
+  const newCap = 2 * (t.linked - 1) + 2;
+  const seated = t.seats.filter(Boolean);
+  if (seated.length > newCap) return null; // would evict a seated guest — not allowed
+  const oldLinked = t.linked, oldSeats = t.seats.slice();
+  t.linked -= 1;
+  t.seats = seated.concat(Array(newCap - seated.length).fill(null));
+  return () => { t.linked = oldLinked; t.seats = oldSeats; };
+}
+
+function moveDeleteEmptyTable() {
+  const candidates = state.tables.filter(t => t.seats.every(s => !s));
+  if (!candidates.length) return null;
+  const target = candidates[Math.floor(Math.random() * candidates.length)];
+  const idx = state.tables.indexOf(target);
+  const [removed] = state.tables.splice(idx, 1);
+  return () => { state.tables.splice(idx, 0, removed); };
+}
+
+function moveAddTable() {
+  if (state.tables.length >= state.guests.length + 2) return null; // sanity cap, not a real limit
+  pushNewTable();
+  const addedIdx = state.tables.length - 1;
+  return () => { state.tables.splice(addedIdx, 1); };
+}
+
+// physically pushing two tables into one row loses 2 seats (the two inner "ends" disappear into
+// the join) — same math as growing, just for two existing tables at once. This is what lets the
+// search find "3 tables of 4 -> 2 tables of 6" directly, instead of hoping grow+swap+swap+delete
+// happen to land in the right combination by chance.
+function moveMergeTables() {
+  if (state.tables.length < 2) return null;
+  const idx1 = Math.floor(Math.random() * state.tables.length);
+  let idx2 = Math.floor(Math.random() * state.tables.length);
+  if (idx1 === idx2) return null;
+  const tableA = state.tables[idx1], tableB = state.tables[idx2];
+  const newLinked = tableA.linked + tableB.linked;
+  if (newLinked > MAX_LINKED) return null;
+  const newCap = 2 * newLinked + 2;
+  const combinedSeated = tableA.seats.filter(Boolean).concat(tableB.seats.filter(Boolean));
+  if (combinedSeated.length > newCap) return null; // would lose more seats than are spare — not allowed
+
+  const oldLinked = tableA.linked, oldSeats = tableA.seats.slice();
+  const removedIdx = state.tables.indexOf(tableB);
+  state.tables.splice(removedIdx, 1);
+  tableA.linked = newLinked;
+  tableA.seats = combinedSeated.concat(Array(newCap - combinedSeated.length).fill(null));
+
+  return () => {
+    tableA.linked = oldLinked;
+    tableA.seats = oldSeats;
+    state.tables.splice(removedIdx, 0, tableB);
+  };
+}
+
+function randomMoveInPlace() {
+  const r = Math.random();
+  if (r < 0.35) return moveSwap();
+  if (r < 0.60) return movePlaceUnseated(); // weighted highest — seating everyone matters most
+  if (r < 0.68) return moveGrowTable();
+  if (r < 0.76) return moveShrinkTable();
+  if (r < 0.82) return moveDeleteEmptyTable();
+  if (r < 0.94) return moveMergeTables(); // the direct path to "fewer, bigger tables"
+  return moveAddTable();
+}
+
+// Guarantees every unseated guest gets a seat, deterministically — never left to chance, and never
+// splits a "must sit together" cluster (that's a hard constraint, not a preference — shared-group
+// membership is deliberately NOT clustered here, since that's a soft signal the stochastic search
+// already optimizes for via scoring; forcing it into the seed step here previously caused clusters
+// of a dozen+ people — e.g. a big family group — to be sliced into arbitrary 4-seat chunks by array
+// order, scattering "must" pairs across different tables before the search even began).
+function greedySeatEveryone() {
+  const unseated = state.guests.map(g => g.id).filter(id => !seatedTableOf(id));
+  if (!unseated.length) return;
+
+  const parent = new Map(unseated.map(id => [id, id]));
+  function find(x) { while (parent.get(x) !== x) { parent.set(x, parent.get(parent.get(x))); x = parent.get(x); } return x; }
+  function union(a, b) { const ra = find(a), rb = find(b); if (ra !== rb) parent.set(ra, rb); }
+
+  state.rels.filter(r => r.type === 'must').forEach(r => {
+    if (parent.has(r.a) && parent.has(r.b)) union(r.a, r.b);
+  });
+
+  const byCluster = new Map();
+  unseated.forEach(id => {
+    const key = find(id);
+    if (!byCluster.has(key)) byCluster.set(key, []);
+    byCluster.get(key).push(id);
+  });
+
+  // Pack clusters into as few tables as possible (first-fit-decreasing bin packing) instead of one
+  // table per cluster — most guests have no "must" partner at all and would otherwise each get a
+  // whole table to themselves. A cluster is never split across bins, so "must" pairs stay intact;
+  // the stochastic search then only has to polish this for social fit (and split it back up if a
+  // packed-together bin scores badly), not discover the consolidation from scratch.
+  const maxCap = 2 * MAX_LINKED + 2;
+  const bins = [];
+  [...byCluster.values()].sort((a, b) => b.length - a.length).forEach(cluster => {
+    if (cluster.length > maxCap) {
+      for (let i = 0; i < cluster.length; i += maxCap) bins.push(cluster.slice(i, i + maxCap));
+      return;
+    }
+    let target = null, bestRemaining = Infinity;
+    bins.forEach(bin => {
+      const remaining = maxCap - bin.length;
+      if (cluster.length <= remaining && remaining < bestRemaining) { target = bin; bestRemaining = remaining; }
+    });
+    if (target) target.push(...cluster);
+    else bins.push(cluster.slice());
+  });
+
+  bins.forEach(ids => {
+    pushNewTable();
+    const table = state.tables[state.tables.length - 1];
+    table.linked = Math.max(1, Math.ceil((ids.length - 2) / 2));
+    table.seats = Array(tableCapacity(table)).fill(null);
+    ids.forEach((id, k) => { table.seats[k] = id; });
+  });
+}
+
+// simulated annealing, not strict hill-climbing: reaching a better arrangement (e.g. "these two
+// groups got shuffled together, un-shuffle them") often requires one swap that looks *worse*
+// before a second swap pays off. Never accepting a worse move gets stuck in exactly that trap —
+// so early on (temperature high) we sometimes accept a worse move to escape it, cooling toward
+// pure-greedy by the end. The best state seen at any point is tracked separately and restored
+// at the end, since the annealed "current" state can wander below it.
+function hillClimb(iterations) {
+  let currentScore = searchScore(planScore());
+  let bestPlan = planScore(); // full object, so "best" is judged by isBetterPlan (violations dominate), not the raw scalar used for SA acceptance
+  let bestSnapshot = cloneAllTables();
+  for (let i = 0; i < iterations; i++) {
+    const undo = randomMoveInPlace();
+    if (!undo) continue;
+    const newPlan = planScore();
+    const newScore = searchScore(newPlan);
+    const delta = newScore - currentScore;
+    const temperature = 20 * (1 - i / iterations) + 0.5;
+    if (delta >= 0 || Math.random() < Math.exp(delta / temperature)) {
+      currentScore = newScore;
+      if (isBetterPlan(newPlan, bestPlan)) { bestPlan = newPlan; bestSnapshot = cloneAllTables(); }
+    } else {
+      undo();
+    }
+  }
+  restoreAllTables(bestSnapshot);
+}
+
+function runSeatingOptimizer() {
+  const trueOriginalSnapshot = cloneAllTables(); // what the user actually has, before any of this
+  const trueOriginalScore = planScore();
+  if (!state.guests.length) { alert('Add some guests first — there\'s nothing to seat yet.'); return; }
+
+  // guarantee everyone has a seat before optimizing at all — completeness is never left up to
+  // whether the random search happens to get there.
+  greedySeatEveryone();
+  const workingBaseline = cloneAllTables();
+
+  const RESTARTS = 8, ITERATIONS = 2500;
+  let bestSnapshot = workingBaseline, bestScore = planScore();
+  for (let r = 0; r < RESTARTS; r++) {
+    restoreAllTables(workingBaseline);
+    hillClimb(ITERATIONS);
+    const candidateScore = planScore();
+    if (isBetterPlan(candidateScore, bestScore)) { bestScore = candidateScore; bestSnapshot = cloneAllTables(); }
+  }
+  restoreAllTables(trueOriginalSnapshot); // don't leave state mutated while asking for confirmation
+
+  if (!isBetterPlan(bestScore, trueOriginalScore)) {
+    const scoreNote = trueOriginalScore.finalScore === null ? '' : ` (current score: ${trueOriginalScore.finalScore}/100)`;
+    alert(`No better arrangement found this run${scoreNote}. Your seating may already be solid — feel free to try again for a different random search.`);
+    return;
+  }
+
+  const seatedDelta = bestScore.seatedCount - trueOriginalScore.seatedCount;
+  const violDelta = (trueOriginalScore.mustViolations + trueOriginalScore.conflictViolations) - (bestScore.mustViolations + bestScore.conflictViolations);
+  const extras = [];
+  if (violDelta > 0) extras.push(`resolves ${violDelta} constraint violation${violDelta === 1 ? '' : 's'}`);
+  if (seatedDelta > 0) extras.push(`seats ${seatedDelta} more guest${seatedDelta === 1 ? '' : 's'}`);
+  if (bestSnapshot.length !== trueOriginalSnapshot.length) extras.push(`${bestSnapshot.length} table${bestSnapshot.length === 1 ? '' : 's'} instead of ${trueOriginalSnapshot.length}`);
+  const fromScore = trueOriginalScore.finalScore === null ? 'no plan yet' : trueOriginalScore.finalScore;
+  const msg = `Found a better arrangement: ${fromScore} → ${bestScore.finalScore}/100` +
+    (extras.length ? ` (${extras.join(', ')})` : '') +
+    `.\n\nApply this arrangement? (You can still Undo afterward.)`;
+  if (!confirm(msg)) return;
+
+  restoreAllTables(bestSnapshot);
+  save(); renderAll();
+}
+
+function suggestBetterPlan() {
+  const btn = document.getElementById('optimizeBtn');
+  btn.disabled = true; btn.textContent = 'Optimizing…';
+  setTimeout(() => {
+    try { runSeatingOptimizer(); }
+    finally { btn.disabled = false; btn.textContent = '✨ Suggest better plan'; }
+  }, 20);
+}
+
+// ===== Whole-plan reset / share =====
+
+function resetAll() {
+  if (!confirm('Clear all guests, groups, relationships and tables? This cannot be undone.')) return;
+  state.guests = []; state.groups = []; state.rels = []; state.tables = [];
+  save(); renderAll();
+}
+
+// share the whole plan as a file: guests, groups, relationships, tables (with positions) — send it,
+// the other person loads it, and they get the identical layout.
+function exportJson() {
+  const blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'seating-plan.json';
+  a.click();
+}
+
+function importJson(ev) {
+  const file = ev.target.files[0];
+  ev.target.value = ''; // so picking the same file again still fires 'change'
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    let loaded;
+    try { loaded = JSON.parse(reader.result); }
+    catch (e) { alert('That file is not valid JSON.'); return; }
+    if (!loaded || !Array.isArray(loaded.guests) || !Array.isArray(loaded.tables)) {
+      alert('That file doesn\'t look like a seating plan export.');
+      return;
+    }
+    if (state.guests.length && !confirm('Load this file? It will replace everything currently in the planner.')) return;
+    state.guests = migrateGuestGroups(loaded.guests || []);
+    state.groups = loaded.groups || [];
+    state.rels = loaded.rels || [];
+    state.tables = migrateTablePositions(loaded.tables || []);
+    save(); renderAll();
+  };
+  reader.readAsText(file);
+}
+
+// ===== Tables & seating =====
+
+function tableCapacity(t) { return 2 * t.linked + 2; }
+// stack new tables below whatever's already there so a wide "linked" table never overlaps the next one
+function pushNewTable() {
+  const n = state.tables.length;
+  const y = state.tables.length ? Math.max(...state.tables.map(t => t.y + tableFootprint(t.linked).height)) + 50 : 40;
+  state.tables.push({ id: crypto.randomUUID(), name: 'Table ' + (n + 1), linked: 1, seats: [null, null, null, null], x: 40, y });
+}
+function addTable() { pushNewTable(); save(); renderAll(); }
+
+// lays out every table left-to-right, wrapping to a new row, using each table's ACTUAL current
+// footprint — fixes overlap regardless of how tables got into a messy position (heavy manual
+// dragging, or repeated optimizer runs that grow/merge/delete tables without ever repositioning
+// the survivors relative to each other).
+function arrangeTables() {
+  if (!state.tables.length) return;
+  const margin = 40, gapX = 40, gapY = 70;
+  const room = document.getElementById('room');
+  const rowWidth = Math.max(700, room.clientWidth - margin * 2);
+  let x = margin, y = margin, rowHeight = 0;
+  state.tables.forEach(t => {
+    const fp = tableFootprint(t.linked);
+    if (x > margin && x + fp.width > margin + rowWidth) {
+      x = margin;
+      y += rowHeight + gapY;
+      rowHeight = 0;
+    }
+    t.x = x;
+    t.y = y;
+    x += fp.width + gapX;
+    rowHeight = Math.max(rowHeight, fp.height);
+  });
+  save(); renderAll();
+}
+function deleteTable(id) {
+  const t = state.tables.find(t => t.id === id);
+  const seatedCount = t.seats.filter(Boolean).length;
+  if (seatedCount && !confirm(`Remove ${t.name}? ${seatedCount} seated guest(s) will move back to Unseated.`)) return;
+  state.tables = state.tables.filter(t => t.id !== id);
+  save(); renderAll();
+}
+function setTableLinked(id, linked) {
+  const t = state.tables.find(t => t.id === id);
+  linked = Math.max(1, parseInt(linked) || 1);
+  const newCap = 2 * linked + 2;
+  const seatedGuests = t.seats.filter(Boolean);
+  const overflow = seatedGuests.length - newCap;
+  // shrinking below the seated count used to leave the extra guests in the array at seat
+  // indices seatRect() has no real geometry for — they'd render stacked invisibly on top of
+  // the last valid seat instead of bouncing back to Unseated. Truncate for real, and warn first.
+  if (overflow > 0 && !confirm(`Shrinking ${t.name} to ${newCap} seats will move ${overflow} guest(s) back to Unseated. Continue?`)) {
+    renderAll(); // reset the linked-input's displayed value back to the unchanged t.linked
+    return;
+  }
+  t.linked = linked;
+  const seated = seatedGuests.slice(0, newCap);
+  t.seats = seated.concat(Array(newCap - seated.length).fill(null));
+  save(); renderAll();
+}
+function setTableName(id, name) {
+  state.tables.find(t => t.id === id).name = name;
+  save();
+}
+
+function removeGuestFromAllSeats(guestId) {
+  state.tables.forEach(t => { t.seats = t.seats.map(s => s === guestId ? null : s); });
+}
+function placeGuest(guestId, tableId, seatIndex) {
+  const fromTable = seatedTableOf(guestId);
+  const toTable = state.tables.find(t => t.id === tableId);
+  const displaced = toTable.seats[seatIndex];
+  removeGuestFromAllSeats(guestId);
+  toTable.seats[seatIndex] = guestId;
+  if (displaced && displaced !== guestId && fromTable) {
+    fromTable.seats[fromTable.seats.indexOf(null) === -1 ? 0 : fromTable.seats.indexOf(null)] = displaced;
+  }
+  save(); renderAll();
+}
+function dropOnPool(ev) {
+  ev.preventDefault(); ev.currentTarget.classList.remove('dragover');
+  const guestId = ev.dataTransfer.getData('text/plain');
+  removeGuestFromAllSeats(guestId);
+  save(); renderAll();
+}
+
+// physical layout: n linked square tables in a row -> 2n+2 seats around the perimeter.
+// `scale` is reused for both the PNG export (fixed, always bigger) and the live room zoom
+// (interactive, via roomZoom) — same geometry math either way.
+const SQ = 82, PAD = 46, SEAT_W = 68, SEAT_H = 34, SEAT_W2 = 34, SEAT_H2 = 60;
+function tableFootprint(n, scale = 1) { return { width: n * SQ * scale + PAD * scale * 2, height: SQ * scale + PAD * scale * 2 }; }
+function seatRect(n, idx, scale = 1) {
+  const sq = SQ * scale, pad = PAD * scale, sw = SEAT_W * scale, sh = SEAT_H * scale, sw2 = SEAT_W2 * scale, sh2 = SEAT_H2 * scale, gap = 6 * scale;
+  if (idx < n) return { left: pad + idx * sq + (sq - sw) / 2, top: pad - sh - gap, width: sw, height: sh };
+  if (idx < 2 * n) { const i = idx - n; return { left: pad + i * sq + (sq - sw) / 2, top: pad + sq + gap, width: sw, height: sh }; }
+  if (idx === 2 * n) return { left: pad - sw2 - gap, top: pad + (sq - sh2) / 2, width: sw2, height: sh2 };
+  return { left: pad + n * sq + gap, top: pad + (sq - sh2) / 2, width: sw2, height: sh2 };
+}
+
+// ===== Guest chip / avatar rendering =====
+
+function initials(name) {
+  const parts = name.trim().split(/\s+/);
+  return parts.length > 1 ? (parts[0][0] + parts[parts.length - 1][0]).toUpperCase() : name.slice(0, 2).toUpperCase();
+}
+
+function makeGroupsBtn(guest, extraClass) {
+  const groupsBtn = document.createElement('span');
+  groupsBtn.className = 'group-dots' + (extraClass ? ' ' + extraClass : '');
+  groupsBtn.title = 'Edit groups';
+  const gs = guest.groups.map(id => groupById(id)).filter(Boolean);
+  groupsBtn.innerHTML = gs.length
+    ? gs.slice(0, 3).map(g => `<span class="dot" style="background:${g.color}"></span>`).join('') + (gs.length > 3 ? `<span class="more">+${gs.length - 3}</span>` : '')
+    : `<span class="dot-empty">+</span>`;
+  groupsBtn.onclick = e => { e.stopPropagation(); openGroupPicker(guest.id, groupsBtn); };
+  return groupsBtn;
+}
+
+function makeDeleteBtn(guest, extraClass) {
+  const delBtn = document.createElement('span');
+  delBtn.className = extraClass;
+  delBtn.textContent = '✕';
+  delBtn.title = 'Remove guest';
+  delBtn.onclick = e => { e.stopPropagation(); deleteGuest(guest.id); };
+  return delBtn;
+}
+
+// avatarMode: seat is too narrow for a full name (physically-narrow end seats, or zoomed way out) —
+// show initials in a circle instead, full name revealed on hover via pure-CSS tooltip
+function chip(guest, avatarMode) {
+  if (avatarMode) {
+    const el = document.createElement('div');
+    el.className = 'avatar-wrap' + (guest.id === selectedGuestId ? ' selected' : '');
+    el.draggable = true;
+    el.title = guest.name + ' (click to pick up, double-click to rename)';
+    el.ondragstart = e => e.dataTransfer.setData('text/plain', guest.id);
+    el.ondblclick = () => renameGuest(guest.id);
+    el.onclick = e => { e.stopPropagation(); toggleSelectGuest(guest.id); };
+
+    const circle = document.createElement('div');
+    circle.className = 'avatar-circle';
+    circle.textContent = initials(guest.name);
+    el.appendChild(circle);
+
+    const tip = document.createElement('div');
+    tip.className = 'name-tip';
+    tip.textContent = guest.name;
+    el.appendChild(tip);
+
+    el.appendChild(makeGroupsBtn(guest, 'avatar-badge'));
+    el.appendChild(makeDeleteBtn(guest, 'avatar-del'));
+    return el;
+  }
+
+  const el = document.createElement('div');
+  el.className = 'chip' + (guest.id === selectedGuestId ? ' selected' : '');
+  el.draggable = true;
+  el.title = guest.name + ' (click to pick up, double-click to rename)';
+  el.ondragstart = e => e.dataTransfer.setData('text/plain', guest.id);
+  el.ondblclick = () => renameGuest(guest.id);
+  el.onclick = e => { e.stopPropagation(); toggleSelectGuest(guest.id); };
+
+  const label = document.createElement('span');
+  label.className = 'name';
+  label.textContent = guest.name;
+  el.appendChild(label);
+  el.appendChild(makeGroupsBtn(guest));
+  el.appendChild(makeDeleteBtn(guest, 'chip-del'));
+
+  return el;
+}
+
+// ===== Room canvas: drag, pan, zoom =====
+
+function startTableDrag(ev, tableId, wrapper) {
+  if (ev.target.closest('input, button')) return;
+  ev.preventDefault();
+  ev.stopPropagation(); // don't let this also start a canvas pan
+  const t = state.tables.find(t => t.id === tableId);
+  const startX = ev.clientX, startY = ev.clientY, origX = t.x, origY = t.y;
+  function onMove(e) {
+    // t.x/t.y are stored unscaled ("world" space) — divide the screen delta by zoom to match
+    t.x = Math.max(0, origX + (e.clientX - startX) / roomZoom);
+    t.y = Math.max(0, origY + (e.clientY - startY) / roomZoom);
+    wrapper.style.left = (t.x * roomZoom) + 'px';
+    wrapper.style.top = (t.y * roomZoom) + 'px';
+  }
+  function onUp() { document.removeEventListener('pointermove', onMove); document.removeEventListener('pointerup', onUp); save(); }
+  document.addEventListener('pointermove', onMove);
+  document.addEventListener('pointerup', onUp);
+}
+
+function startCanvasPan(ev, room) {
+  if (ev.target !== room) return; // only pan when grabbing empty canvas, not a table
+  ev.preventDefault();
+  const startX = ev.clientX, startY = ev.clientY;
+  const startLeft = room.scrollLeft, startTop = room.scrollTop;
+  room.classList.add('panning');
+  function onMove(e) {
+    room.scrollLeft = startLeft - (e.clientX - startX);
+    room.scrollTop = startTop - (e.clientY - startY);
+  }
+  function onUp() { room.classList.remove('panning'); document.removeEventListener('pointermove', onMove); document.removeEventListener('pointerup', onUp); }
+  document.addEventListener('pointermove', onMove);
+  document.addEventListener('pointerup', onUp);
+}
+
+// zoom around a fixed content point (worldX, worldY), keeping that point under the same
+// screen position after rezooming — used by both wheel-zoom (point = cursor) and the +/- buttons
+// (point = viewport center)
+function zoomAround(newZoom, worldX, worldY, screenX, screenY) {
+  const room = document.getElementById('room');
+  roomZoom = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, newZoom));
+  renderAll();
+  room.scrollLeft = worldX * roomZoom - screenX;
+  room.scrollTop = worldY * roomZoom - screenY;
+}
+function stepZoom(factor) {
+  const room = document.getElementById('room');
+  const rect = room.getBoundingClientRect();
+  const screenX = rect.width / 2, screenY = rect.height / 2;
+  const worldX = (room.scrollLeft + screenX) / roomZoom, worldY = (room.scrollTop + screenY) / roomZoom;
+  zoomAround(roomZoom * factor, worldX, worldY, screenX, screenY);
+}
+function onRoomWheel(ev) {
+  if (!(ev.ctrlKey || ev.metaKey)) return; // plain scroll still pans/scrolls normally
+  ev.preventDefault();
+  const room = ev.currentTarget;
+  const rect = room.getBoundingClientRect();
+  const screenX = ev.clientX - rect.left, screenY = ev.clientY - rect.top;
+  const worldX = (room.scrollLeft + screenX) / roomZoom, worldY = (room.scrollTop + screenY) / roomZoom;
+  zoomAround(roomZoom * (ev.deltaY < 0 ? 1.1 : 1 / 1.1), worldX, worldY, screenX, screenY);
+}
+
+// ===== Render =====
+
+function renderAll() {
+  // groups
+  const gl = document.getElementById('groupList');
+  gl.innerHTML = '';
+  state.groups.forEach(g => {
+    const li = document.createElement('li');
+    li.innerHTML = `<span><span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:${g.color};margin-right:7px;"></span>${g.name}</span>`;
+    const btn = document.createElement('button'); btn.className = 'icon'; btn.textContent = '✕'; btn.onclick = () => deleteGroup(g.id);
+    li.appendChild(btn);
+    gl.appendChild(li);
+  });
+
+  // rel selects
+  const opts = state.guests.map(g => `<option value="${g.id}">${g.name}</option>`).join('');
+  document.getElementById('relA').innerHTML = opts;
+  document.getElementById('relB').innerHTML = opts;
+
+  // rel list
+  document.getElementById('relCount').textContent = state.rels.length;
+  const relLabels = { must: '↔ must sit with', conflict: '⚡ must NOT sit with', knows: '~ knows' };
+  const rl = document.getElementById('relList');
+  rl.innerHTML = '';
+  state.rels.forEach(r => {
+    const a = guestById(r.a), b = guestById(r.b);
+    if (!a || !b) return;
+    const li = document.createElement('li');
+    li.innerHTML = `<span class="${r.type === 'knows' ? 'knows' : r.type}">${a.name} ${relLabels[r.type]} ${b.name}</span>`;
+    const btn = document.createElement('button'); btn.className = 'icon'; btn.textContent = '✕'; btn.onclick = () => deleteRel(r.id);
+    li.appendChild(btn);
+    rl.appendChild(li);
+  });
+
+  // pool (filterable, since it can get long)
+  const filter = document.getElementById('poolFilter').value.trim().toLowerCase();
+  const unseated = state.guests.filter(g => !seatedTableOf(g.id));
+  document.getElementById('unseatedCount').textContent = unseated.length;
+  document.getElementById('guestStats').textContent =
+    `${state.guests.length} guest${state.guests.length === 1 ? '' : 's'} · ${state.guests.length - unseated.length} seated · ${unseated.length} unseated`;
+  const pool = document.getElementById('pool');
+  pool.innerHTML = '';
+  unseated.filter(g => !filter || g.name.toLowerCase().includes(filter)).forEach(g => pool.appendChild(chip(g)));
+
+  // warnings
+  const w = document.getElementById('warnings');
+  const unmet = unmetMustPairs(), broken = brokenConflictPairs();
+  w.innerHTML =
+    (unmet.length ? `<div class="warn">⚠ Not sitting together yet: ${unmet.map(r => guestById(r.a).name + ' & ' + guestById(r.b).name).join(', ')}</div>` : '') +
+    (broken.length ? `<div class="warn">⛔ Seated together but shouldn't be: ${broken.map(r => guestById(r.a).name + ' & ' + guestById(r.b).name).join(', ')}</div>` : '');
+
+  // undo
+  document.getElementById('undoBtn').disabled = !undoSnapshot;
+
+  // plan score
+  closeScorePanel(); // avoid showing a stale breakdown after the state just changed
+  const score = planScore();
+  const scoreBadge = document.getElementById('scoreBadge');
+  scoreBadge.textContent = score.finalScore === null ? 'Score: —' : `Score: ${score.finalScore}/100`;
+  scoreBadge.classList.toggle('bad', score.mustViolations > 0 || score.conflictViolations > 0);
+
+  // room / tables
+  document.getElementById('zoomLabel').textContent = Math.round(roomZoom * 100) + '%';
+  const room = document.getElementById('room');
+  room.innerHTML = '';
+  state.tables.forEach(t => {
+    const n = t.linked;
+    const fp = tableFootprint(n, roomZoom);
+    const pad = PAD * roomZoom, sq = SQ * roomZoom;
+    const wrapper = document.createElement('div');
+    wrapper.className = 'table-plan';
+    wrapper.style.left = (t.x * roomZoom) + 'px';
+    wrapper.style.top = (t.y * roomZoom) + 'px';
+    wrapper.style.width = fp.width + 'px';
+    wrapper.style.height = fp.height + 'px';
+
+    const handle = document.createElement('div');
+    handle.className = 'table-handle';
+    const cap = tableCapacity(t);
+    handle.innerHTML = `<span class="grip" title="drag to move">⠿</span>
+      <input class="name-input" value="${t.name}" onchange="setTableName('${t.id}',this.value)">
+      <span class="cap">🔗<input type="number" class="linked-input" min="1" value="${t.linked}" onchange="setTableLinked('${t.id}',this.value)">= ${cap} seats</span>
+      <button class="icon" title="Remove table">✕</button>`;
+    handle.onpointerdown = e => startTableDrag(e, t.id, wrapper);
+    handle.querySelector('button.icon').onclick = () => deleteTable(t.id);
+    wrapper.appendChild(handle);
+
+    const surface = document.createElement('div');
+    surface.className = 'table-surface';
+    surface.style.left = pad + 'px'; surface.style.top = pad + 'px';
+    surface.style.width = (n * sq) + 'px'; surface.style.height = sq + 'px';
+    surface.onpointerdown = e => startTableDrag(e, t.id, wrapper);
+    wrapper.appendChild(surface);
+
+    t.seats.forEach((guestId, i) => {
+      const r = seatRect(n, i, roomZoom);
+      const seat = document.createElement('div');
+      seat.className = 'seat';
+      seat.style.left = r.left + 'px'; seat.style.top = r.top + 'px';
+      seat.style.width = r.width + 'px'; seat.style.height = r.height + 'px';
+      seat.ondragover = e => { e.preventDefault(); seat.classList.add('dragover'); };
+      seat.ondragleave = () => seat.classList.remove('dragover');
+      seat.ondrop = e => { e.preventDefault(); seat.classList.remove('dragover'); placeGuest(e.dataTransfer.getData('text/plain'), t.id, i); };
+      seat.onclick = () => trySeatSelected(t.id, i);
+      if (guestId) { const g = guestById(guestId); if (g) seat.appendChild(chip(g, r.width < SEAT_LEGIBLE_PX)); }
+      wrapper.appendChild(seat);
+    });
+
+    room.appendChild(wrapper);
+  });
+}
+
+// ===== Export: .txt and .png =====
+
+function exportTxt() {
+  const text = state.tables.map(t => {
+    const names = t.seats.filter(Boolean).map(id => guestById(id)?.name).filter(Boolean);
+    return `${t.name}:\n` + names.join(',\n');
+  }).join('\n\n');
+  const blob = new Blob([text], { type: 'text/plain' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'seating.txt';
+  a.click();
+}
+
+function roundRectPath(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+function fillEllipsizedText(ctx, str, cx, cy, maxWidth) {
+  let s = str;
+  if (ctx.measureText(s).width > maxWidth) {
+    while (s.length > 1 && ctx.measureText(s + '…').width > maxWidth) s = s.slice(0, -1);
+    s += '…';
+  }
+  ctx.fillText(s, cx, cy);
+}
+
+// draw the whole floor plan straight onto a <canvas> (rects + text), then export as PNG.
+// (an earlier version rasterized the live DOM via an SVG foreignObject, but Chrome
+// permanently taints any canvas drawn from a foreignObject image, blocking toBlob/toDataURL —
+// so we just paint the same layout math ourselves instead.)
+function exportPng() {
+  if (!state.tables.length) { alert('Add a table first.'); return; }
+  const root = getComputedStyle(document.documentElement);
+  const col = name => root.getPropertyValue(name).trim();
+  const bg = col('--bg'), panel = col('--panel'), accent = col('--accent'), border = col('--border'), text = col('--text');
+
+  // draw everything ~2x bigger than the on-screen compact layout so seat boxes have real
+  // room for full names — the interactive UI stays small/click-friendly, only the export grows.
+  const LAYOUT_SCALE = 2;
+  const margin = 30, labelSpace = 34; // labelSpace: room for a table's name label, which floats above its own box
+  const maxX = Math.max(...state.tables.map(t => t.x * LAYOUT_SCALE + tableFootprint(t.linked, LAYOUT_SCALE).width));
+  const maxY = Math.max(...state.tables.map(t => t.y * LAYOUT_SCALE + tableFootprint(t.linked, LAYOUT_SCALE).height));
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const canvas = document.createElement('canvas');
+  canvas.width = (maxX + margin) * dpr;
+  canvas.height = (maxY + margin + labelSpace) * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, maxX + margin, maxY + margin + labelSpace);
+  ctx.translate(0, labelSpace); // so a label above the topmost table (y=0) still fits on the canvas
+
+  state.tables.forEach(t => {
+    const n = t.linked, fp = tableFootprint(n, LAYOUT_SCALE), ox = t.x * LAYOUT_SCALE, oy = t.y * LAYOUT_SCALE;
+    const pad = PAD * LAYOUT_SCALE, sq = SQ * LAYOUT_SCALE;
+
+    roundRectPath(ctx, ox + pad, oy + pad, n * sq, sq, 8);
+    ctx.fillStyle = panel; ctx.fill();
+    ctx.lineWidth = 2.5; ctx.strokeStyle = accent; ctx.stroke();
+
+    ctx.font = 'bold 16px -apple-system, system-ui, sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+    ctx.fillStyle = text;
+    fillEllipsizedText(ctx, `${t.name} · ${tableCapacity(t)} seats`, ox + fp.width / 2, oy - 10, fp.width);
+
+    t.seats.forEach((guestId, i) => {
+      const r = seatRect(n, i, LAYOUT_SCALE);
+      roundRectPath(ctx, ox + r.left, oy + r.top, r.width, r.height, 8);
+      ctx.fillStyle = bg; ctx.fill();
+      ctx.setLineDash([4, 3]); ctx.lineWidth = 1.5; ctx.strokeStyle = border; ctx.stroke(); ctx.setLineDash([]);
+      const guest = guestId && guestById(guestId);
+      if (guest) {
+        ctx.font = '13px -apple-system, system-ui, sans-serif';
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillStyle = text;
+        fillEllipsizedText(ctx, guest.name, ox + r.left + r.width / 2, oy + r.top + r.height / 2, r.width - 10);
+      }
+    });
+  });
+
+  canvas.toBlob(blob => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'seating-plan.png';
+    a.click();
+  });
+}
+
+// ===== Startup =====
+
+document.getElementById('room').onpointerdown = e => startCanvasPan(e, e.currentTarget);
+document.getElementById('room').addEventListener('wheel', onRoomWheel, { passive: false });
+renderAll();

@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Seating Planner</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div class="appbar">
+  <h1>🪑 Seating Planner</h1>
+  <span class="tag">local &middot; autosaved</span>
+  <span style="flex:1;"></span>
+  <button onclick="exportJson()">Save file</button>
+  <button onclick="document.getElementById('loadJsonInput').click()">Load file</button>
+  <input type="file" id="loadJsonInput" accept="application/json,.json" style="display:none" onchange="importJson(event)">
+  <button id="undoBtn" onclick="undo()" disabled title="Undo the last change (ctrl/cmd + Z)">Undo</button>
+  <button onclick="resetAll()">Start over</button>
+</div>
+
+<div class="body">
+  <div class="sidebar">
+    <section>
+      <h2>1 · Guests</h2>
+      <textarea id="guestPaste" placeholder="Paste one guest name per line"></textarea>
+      <button class="primary" style="margin-top:6px;width:100%;" onclick="addGuests()">Add guests</button>
+      <p class="stat-line" id="guestStats"></p>
+    </section>
+
+    <section>
+      <h2>Groups</h2>
+      <div class="row">
+        <input id="groupName" placeholder="Group name">
+        <input id="groupColor" type="color" value="#5b6cf0">
+        <button onclick="addGroup()">Add</button>
+      </div>
+      <ul class="plain" id="groupList"></ul>
+    </section>
+
+    <section>
+      <h2>2 · Relationships</h2>
+      <div class="row">
+        <select id="relA"></select>
+        <select id="relB"></select>
+      </div>
+      <div class="row">
+        <select id="relType">
+          <option value="must">must sit together</option>
+          <option value="conflict">must NOT sit together</option>
+          <option value="knows">knows each other</option>
+        </select>
+        <button onclick="addRel()">Add</button>
+      </div>
+      <details id="relDetails">
+        <summary>Show relationships (<span id="relCount">0</span>)</summary>
+        <ul class="plain" id="relList"></ul>
+      </details>
+    </section>
+
+    <section style="margin-bottom:0;">
+      <h2>Unseated guests (<span id="unseatedCount">0</span>)</h2>
+      <input type="search" id="poolFilter" placeholder="Filter guests…" oninput="renderAll()">
+      <div class="pool" id="pool" onclick="if (event.target === this) unseatSelected();" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="this.classList.remove('dragover')" ondrop="dropOnPool(event)"></div>
+    </section>
+  </div>
+
+  <div class="main">
+    <div class="main-toolbar">
+      <span class="hint">3 · Drag a guest onto a seat (or click a guest, then click a seat) &nbsp;·&nbsp; drag a table's title bar to move it &nbsp;·&nbsp; ctrl/cmd + scroll to zoom in on a table</span>
+      <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; justify-content:flex-end;">
+        <div class="zoom-controls">
+          <button onclick="stepZoom(0.8)" title="Zoom out">−</button>
+          <span class="zoom-label" id="zoomLabel">100%</span>
+          <button onclick="stepZoom(1.25)" title="Zoom in">+</button>
+        </div>
+        <button id="scoreBadge" onclick="toggleScorePanel()" title="Plan quality score — click for a breakdown">Score: —</button>
+        <button id="optimizeBtn" onclick="suggestBetterPlan()">✨ Suggest better plan</button>
+        <button onclick="arrangeTables()" title="Lay all tables out neatly, side by side">Arrange tables</button>
+        <button class="primary" onclick="addTable()">+ Add table</button>
+        <button onclick="exportPng()">Export image</button>
+        <button onclick="exportTxt()">Export .txt</button>
+      </div>
+    </div>
+    <div id="warnings"></div>
+    <div class="room" id="room"></div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
