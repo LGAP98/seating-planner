@@ -49,10 +49,36 @@ const ZOOM_MIN = 0.4, ZOOM_MAX = 3;
 // zooming in grows seats past this and the full name just appears
 const SEAT_LEGIBLE_PX = 56;
 
+// contextual relationship picker state (used by toggleSelectGuest, defined fully in Relationships section)
+let pairSelectId = null;
+let relPickerEl = null;
+function closeRelPicker() {
+  if (relPickerEl) { relPickerEl.remove(); relPickerEl = null; }
+  if (pairSelectId) { pairSelectId = null; renderAll(); }
+}
+
 // click-to-place: an alternative to drag-and-drop — click a guest, then click a seat (or the
 // empty pool background to unseat). Transient UI state, not persisted.
 let selectedGuestId = null;
-function toggleSelectGuest(id) { selectedGuestId = (selectedGuestId === id) ? null : id; renderAll(); }
+function toggleSelectGuest(id, ev) {
+  if (ev && ev.shiftKey) {
+    ev.stopPropagation();
+    if (!pairSelectId) {
+      pairSelectId = id;
+      renderAll();
+    } else if (pairSelectId === id) {
+      pairSelectId = null;
+      renderAll();
+    } else {
+      showRelPicker(pairSelectId, id, ev.clientX, ev.clientY);
+      pairSelectId = null;
+    }
+    return;
+  }
+  if (pairSelectId) { closeRelPicker(); return; }
+  selectedGuestId = (selectedGuestId === id) ? null : id;
+  renderAll();
+}
 function trySeatSelected(tableId, seatIndex) {
   if (!selectedGuestId) return;
   placeGuest(selectedGuestId, tableId, seatIndex);
@@ -72,6 +98,7 @@ document.addEventListener('drop', e => e.preventDefault());
 document.addEventListener('keydown', e => {
   const mod = e.ctrlKey || e.metaKey;
   if (mod && e.key.toLowerCase() === 'z' && !['INPUT', 'TEXTAREA'].includes(e.target.tagName)) { e.preventDefault(); undo(); }
+  else if (e.key === 'Escape' && pairSelectId) { closeRelPicker(); }
   else if (e.key === 'Escape' && selectedGuestId) { selectedGuestId = null; renderAll(); }
 });
 
@@ -173,13 +200,148 @@ function openGroupPicker(guestId, anchorEl) {
 
 // ===== Relationships =====
 
+// -- searchable combobox for guest picking --
+const comboState = { A: { selectedId: null }, B: { selectedId: null } };
+
+function initCombobox(wrapperId, key) {
+  const wrap = document.getElementById(wrapperId);
+  const input = wrap.querySelector('input');
+  const list = wrap.querySelector('.combobox-list');
+  let activeIndex = -1;
+
+  function open() { wrap.classList.add('open'); refreshList(); }
+  function close() { wrap.classList.remove('open'); activeIndex = -1; }
+
+  function refreshList() {
+    const q = input.value.trim().toLowerCase();
+    const otherId = key === 'A' ? comboState.B.selectedId : comboState.A.selectedId;
+    let matches = state.guests;
+    if (q && !comboState[key].selectedId) matches = matches.filter(g => g.name.toLowerCase().includes(q));
+    list.innerHTML = '';
+    if (!matches.length) { list.innerHTML = '<div class="combobox-empty">No matches</div>'; return; }
+
+    const grouped = new Map();
+    matches.forEach(g => {
+      const groupNames = g.groups.map(id => groupById(id)).filter(Boolean).map(gr => gr.name);
+      const label = groupNames.length ? groupNames.join(', ') : '';
+      if (!grouped.has(label)) grouped.set(label, []);
+      grouped.get(label).push(g);
+    });
+
+    let idx = 0;
+    for (const [groupLabel, guests] of grouped) {
+      guests.forEach(g => {
+        const item = document.createElement('div');
+        item.className = 'combobox-item' + (idx === activeIndex ? ' active' : '');
+        if (g.id === otherId) { item.style.opacity = '0.4'; item.title = 'Already selected as the other person'; }
+        const dots = g.groups.map(id => groupById(id)).filter(Boolean)
+          .slice(0, 3).map(gr => `<span class="dot" style="background:${gr.color}"></span>`).join('');
+        item.innerHTML = (dots ? `<span class="cb-dots">${dots}</span>` : '') + g.name;
+        const gId = g.id;
+        item.onmousedown = e => { e.preventDefault(); select(gId, g.name); };
+        list.appendChild(item);
+        idx++;
+      });
+    }
+  }
+
+  function select(id, name) {
+    comboState[key].selectedId = id;
+    input.value = name;
+    input.classList.add('has-value');
+    close();
+  }
+
+  function clearSelection() {
+    comboState[key].selectedId = null;
+    input.classList.remove('has-value');
+  }
+
+  input.addEventListener('focus', () => { if (!comboState[key].selectedId) open(); });
+  input.addEventListener('input', () => { clearSelection(); open(); });
+  input.addEventListener('keydown', e => {
+    const items = list.querySelectorAll('.combobox-item');
+    if (e.key === 'ArrowDown') { e.preventDefault(); activeIndex = Math.min(activeIndex + 1, items.length - 1); refreshList(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); activeIndex = Math.max(activeIndex - 1, 0); refreshList(); }
+    else if (e.key === 'Enter' && activeIndex >= 0 && items[activeIndex]) {
+      e.preventDefault();
+      items[activeIndex].onmousedown(e);
+    }
+    else if (e.key === 'Escape') { close(); input.blur(); }
+    else if (e.key === 'Backspace' && comboState[key].selectedId) { clearSelection(); input.value = ''; open(); }
+  });
+
+  // click on the input when a value is already selected: re-open to allow changing
+  input.addEventListener('mousedown', () => {
+    if (comboState[key].selectedId) { clearSelection(); input.value = ''; setTimeout(open, 0); }
+  });
+
+  document.addEventListener('mousedown', e => { if (!wrap.contains(e.target)) close(); }, true);
+}
+initCombobox('comboA', 'A');
+initCombobox('comboB', 'B');
+
 function addRel() {
-  const a = document.getElementById('relA').value, b = document.getElementById('relB').value;
+  const a = comboState.A.selectedId, b = comboState.B.selectedId;
+  const type = document.getElementById('relType').value;
   if (!a || !b || a === b) return;
-  state.rels.push({ id: crypto.randomUUID(), a, b, type: document.getElementById('relType').value });
+  if (isDuplicateRel(a, b, type)) return;
+  state.rels.push({ id: crypto.randomUUID(), a, b, type });
+  comboState.A.selectedId = null; comboState.B.selectedId = null;
+  document.querySelector('#comboA input').value = '';
+  document.querySelector('#comboB input').value = '';
+  document.querySelector('#comboA input').classList.remove('has-value');
+  document.querySelector('#comboB input').classList.remove('has-value');
   save(); renderAll();
 }
+
+function isDuplicateRel(a, b, type) {
+  return state.rels.some(r => r.type === type && ((r.a === a && r.b === b) || (r.a === b && r.b === a)));
+}
+
 function deleteRel(id) { state.rels = state.rels.filter(r => r.id !== id); save(); renderAll(); }
+
+function showRelPicker(guestA, guestB, anchorX, anchorY) {
+  closeRelPicker();
+  const panel = document.createElement('div');
+  panel.className = 'rel-picker';
+  const nameA = guestById(guestA).name, nameB = guestById(guestB).name;
+  panel.innerHTML = `<div class="rp-header">${nameA} & ${nameB}</div>`;
+  [
+    { type: 'must', label: '↔ Must sit together' },
+    { type: 'conflict', label: '⚡ Must NOT sit together' },
+    { type: 'knows', label: '~ Know each other' }
+  ].forEach(opt => {
+    const btn = document.createElement('button');
+    btn.textContent = opt.label;
+    if (isDuplicateRel(guestA, guestB, opt.type)) {
+      btn.style.opacity = '0.4';
+      btn.title = 'Already added';
+      btn.onclick = () => {};
+    } else {
+      btn.onclick = () => {
+        state.rels.push({ id: crypto.randomUUID(), a: guestA, b: guestB, type: opt.type });
+        save();
+        closeRelPicker();
+        renderAll();
+      };
+    }
+    panel.appendChild(btn);
+  });
+  document.body.appendChild(panel);
+
+  const pw = panel.offsetWidth, ph = panel.offsetHeight;
+  const left = Math.max(8, Math.min(anchorX, window.innerWidth - pw - 8));
+  const top = Math.max(8, Math.min(anchorY, window.innerHeight - ph - 8));
+  panel.style.left = left + 'px';
+  panel.style.top = top + 'px';
+  relPickerEl = panel;
+
+  setTimeout(() => {
+    const onOutside = e => { if (!panel.contains(e.target)) { closeRelPicker(); document.removeEventListener('mousedown', onOutside, true); } };
+    document.addEventListener('mousedown', onOutside, true);
+  }, 0);
+}
 
 function unmetMustPairs() {
   return state.rels.filter(r => r.type === 'must').filter(r => {
@@ -971,12 +1133,13 @@ function makeDeleteBtn(guest, extraClass) {
 function chip(guest, avatarMode) {
   if (avatarMode) {
     const el = document.createElement('div');
-    el.className = 'avatar-wrap' + (guest.id === selectedGuestId ? ' selected' : '');
+    el.className = 'avatar-wrap' + (guest.id === selectedGuestId ? ' selected' : '') + (guest.id === pairSelectId ? ' selected-pair' : '');
     el.draggable = true;
-    el.title = guest.name + ' (click to pick up, double-click to rename)';
+    el.title = guest.name + ' (click to pick up, double-click to rename, shift-click to link)';
     el.ondragstart = e => e.dataTransfer.setData('text/plain', guest.id);
     el.ondblclick = () => renameGuest(guest.id);
-    el.onclick = e => { e.stopPropagation(); toggleSelectGuest(guest.id); };
+    el.addEventListener('click', e => { if (e.shiftKey) { e.stopPropagation(); e.stopImmediatePropagation(); toggleSelectGuest(guest.id, e); } }, true);
+    el.onclick = e => { e.stopPropagation(); toggleSelectGuest(guest.id, e); };
 
     const circle = document.createElement('div');
     circle.className = 'avatar-circle';
@@ -994,12 +1157,13 @@ function chip(guest, avatarMode) {
   }
 
   const el = document.createElement('div');
-  el.className = 'chip' + (guest.id === selectedGuestId ? ' selected' : '');
+  el.className = 'chip' + (guest.id === selectedGuestId ? ' selected' : '') + (guest.id === pairSelectId ? ' selected-pair' : '');
   el.draggable = true;
-  el.title = guest.name + ' (click to pick up, double-click to rename)';
+  el.title = guest.name + ' (click to pick up, double-click to rename, shift-click to link)';
   el.ondragstart = e => e.dataTransfer.setData('text/plain', guest.id);
   el.ondblclick = () => renameGuest(guest.id);
-  el.onclick = e => { e.stopPropagation(); toggleSelectGuest(guest.id); };
+  el.addEventListener('click', e => { if (e.shiftKey) { e.stopPropagation(); e.stopImmediatePropagation(); toggleSelectGuest(guest.id, e); } }, true);
+  el.onclick = e => { e.stopPropagation(); toggleSelectGuest(guest.id, e); };
 
   const label = document.createElement('span');
   label.className = 'name';
@@ -1086,11 +1250,6 @@ function renderAll() {
     li.appendChild(btn);
     gl.appendChild(li);
   });
-
-  // rel selects
-  const opts = state.guests.map(g => `<option value="${g.id}">${g.name}</option>`).join('');
-  document.getElementById('relA').innerHTML = opts;
-  document.getElementById('relB').innerHTML = opts;
 
   // rel list
   document.getElementById('relCount').textContent = state.rels.length;

@@ -40,8 +40,8 @@
     <section>
       <h2>2 · Relationships</h2>
       <div class="row">
-        <select id="relA"></select>
-        <select id="relB"></select>
+        <div class="combobox" id="comboA"><input type="text" placeholder="Person A" autocomplete="off"><div class="combobox-list"></div></div>
+        <div class="combobox" id="comboB"><input type="text" placeholder="Person B" autocomplete="off"><div class="combobox-list"></div></div>
       </div>
       <div class="row">
         <select id="relType">
@@ -66,7 +66,7 @@
 
   <div class="main">
     <div class="main-toolbar">
-      <span class="hint">3 · Drag a guest onto a seat (or click a guest, then click a seat) &nbsp;·&nbsp; drag a table's title bar to move it &nbsp;·&nbsp; ctrl/cmd + scroll to zoom in on a table</span>
+      <span class="hint">3 · Drag a guest onto a seat (or click → click to place) &nbsp;·&nbsp; shift-click two guests to add a relationship &nbsp;·&nbsp; ctrl/cmd + scroll to zoom</span>
       <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; justify-content:flex-end;">
         <div class="zoom-controls">
           <button onclick="stepZoom(0.8)" title="Zoom out">−</button>
