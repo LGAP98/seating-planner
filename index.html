@@ -53,6 +53,15 @@
       </div>
       <details id="relDetails">
         <summary>Show relationships (<span id="relCount">0</span>)</summary>
+        <div class="rel-controls">
+          <input type="search" id="relFilter" placeholder="Filter…" oninput="renderAll()">
+          <div class="rel-type-tabs">
+            <button class="rel-tab active" data-filter="all" onclick="setRelTab('all')">All</button>
+            <button class="rel-tab" data-filter="must" onclick="setRelTab('must')">Must</button>
+            <button class="rel-tab" data-filter="conflict" onclick="setRelTab('conflict')">Not</button>
+            <button class="rel-tab" data-filter="knows" onclick="setRelTab('knows')">Knows</button>
+          </div>
+        </div>
         <ul class="plain" id="relList"></ul>
       </details>
     </section>

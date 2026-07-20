@@ -128,10 +128,25 @@ function addGuests() {
 
 function renameGuest(id) {
   const guest = guestById(id);
-  const name = prompt('Rename guest', guest.name);
-  if (!name || !name.trim()) return;
-  guest.name = name.trim();
-  save(); renderAll();
+  const chipEl = document.querySelector(`[data-guest-id="${id}"].chip`);
+  if (!chipEl) { const name = prompt('Rename guest', guest.name); if (!name || !name.trim()) return; guest.name = name.trim(); save(); renderAll(); return; }
+  const nameSpan = chipEl.querySelector('span.name');
+  if (!nameSpan || nameSpan.contentEditable === 'true') return;
+  nameSpan.contentEditable = 'true';
+  nameSpan.focus();
+  const range = document.createRange(); range.selectNodeContents(nameSpan); const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(range);
+  nameSpan.style.cursor = 'text';
+  chipEl.draggable = false;
+  const commit = () => {
+    nameSpan.contentEditable = 'false';
+    nameSpan.style.cursor = '';
+    chipEl.draggable = true;
+    const val = nameSpan.textContent.trim();
+    if (val && val !== guest.name) { guest.name = val; save(); renderAll(); }
+    else { nameSpan.textContent = guest.name; }
+  };
+  nameSpan.onblur = commit;
+  nameSpan.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); nameSpan.blur(); } else if (e.key === 'Escape') { nameSpan.textContent = guest.name; nameSpan.blur(); } };
 }
 
 function deleteGuest(id) {
@@ -301,6 +316,13 @@ function isDuplicateRel(a, b, type) {
 
 function deleteRel(id) { state.rels = state.rels.filter(r => r.id !== id); save(); renderAll(); }
 
+let activeRelTab = 'all';
+function setRelTab(type) {
+  activeRelTab = type;
+  document.querySelectorAll('.rel-tab').forEach(b => b.classList.toggle('active', b.dataset.filter === type));
+  renderAll();
+}
+
 function showRelPicker(guestA, guestB, anchorX, anchorY) {
   closeRelPicker();
   const panel = document.createElement('div');
@@ -341,6 +363,28 @@ function showRelPicker(guestA, guestB, anchorX, anchorY) {
     const onOutside = e => { if (!panel.contains(e.target)) { closeRelPicker(); document.removeEventListener('mousedown', onOutside, true); } };
     document.addEventListener('mousedown', onOutside, true);
   }, 0);
+}
+
+// -- relationship hover highlighting --
+function highlightRelated(guestId) {
+  const related = new Map();
+  state.rels.forEach(r => {
+    if (r.a === guestId) related.set(r.b, r.type);
+    else if (r.b === guestId) related.set(r.a, r.type);
+  });
+  if (!related.size) return;
+  document.querySelectorAll('[data-guest-id]').forEach(el => {
+    const id = el.dataset.guestId;
+    if (id === guestId) return;
+    const type = related.get(id);
+    if (type) el.classList.add('rel-highlight', 'rel-' + type);
+    else el.classList.add('rel-dimmed');
+  });
+}
+function clearHighlights() {
+  document.querySelectorAll('.rel-highlight,.rel-dimmed').forEach(el => {
+    el.classList.remove('rel-highlight', 'rel-must', 'rel-conflict', 'rel-knows', 'rel-dimmed');
+  });
 }
 
 function unmetMustPairs() {
@@ -1134,12 +1178,15 @@ function chip(guest, avatarMode) {
   if (avatarMode) {
     const el = document.createElement('div');
     el.className = 'avatar-wrap' + (guest.id === selectedGuestId ? ' selected' : '') + (guest.id === pairSelectId ? ' selected-pair' : '');
+    el.dataset.guestId = guest.id;
     el.draggable = true;
     el.title = guest.name + ' (click to pick up, double-click to rename, shift-click to link)';
     el.ondragstart = e => e.dataTransfer.setData('text/plain', guest.id);
     el.ondblclick = () => renameGuest(guest.id);
     el.addEventListener('click', e => { if (e.shiftKey) { e.stopPropagation(); e.stopImmediatePropagation(); toggleSelectGuest(guest.id, e); } }, true);
     el.onclick = e => { e.stopPropagation(); toggleSelectGuest(guest.id, e); };
+    el.onmouseenter = () => highlightRelated(guest.id);
+    el.onmouseleave = clearHighlights;
 
     const circle = document.createElement('div');
     circle.className = 'avatar-circle';
@@ -1158,12 +1205,15 @@ function chip(guest, avatarMode) {
 
   const el = document.createElement('div');
   el.className = 'chip' + (guest.id === selectedGuestId ? ' selected' : '') + (guest.id === pairSelectId ? ' selected-pair' : '');
+  el.dataset.guestId = guest.id;
   el.draggable = true;
   el.title = guest.name + ' (click to pick up, double-click to rename, shift-click to link)';
   el.ondragstart = e => e.dataTransfer.setData('text/plain', guest.id);
-  el.ondblclick = () => renameGuest(guest.id);
+  el.ondblclick = e => { e.stopPropagation(); renameGuest(guest.id); };
   el.addEventListener('click', e => { if (e.shiftKey) { e.stopPropagation(); e.stopImmediatePropagation(); toggleSelectGuest(guest.id, e); } }, true);
   el.onclick = e => { e.stopPropagation(); toggleSelectGuest(guest.id, e); };
+  el.onmouseenter = () => highlightRelated(guest.id);
+  el.onmouseleave = clearHighlights;
 
   const label = document.createElement('span');
   label.className = 'name';
@@ -1251,14 +1301,19 @@ function renderAll() {
     gl.appendChild(li);
   });
 
-  // rel list
+  // rel list (filterable by name and type)
   document.getElementById('relCount').textContent = state.rels.length;
   const relLabels = { must: '↔ must sit with', conflict: '⚡ must NOT sit with', knows: '~ knows' };
+  const relFilterText = (document.getElementById('relFilter')?.value || '').trim().toLowerCase();
   const rl = document.getElementById('relList');
   rl.innerHTML = '';
-  state.rels.forEach(r => {
+  const typeOrder = ['must', 'conflict', 'knows'];
+  const sorted = [...state.rels].sort((a, b) => typeOrder.indexOf(a.type) - typeOrder.indexOf(b.type));
+  sorted.forEach(r => {
+    if (activeRelTab !== 'all' && r.type !== activeRelTab) return;
     const a = guestById(r.a), b = guestById(r.b);
     if (!a || !b) return;
+    if (relFilterText && !a.name.toLowerCase().includes(relFilterText) && !b.name.toLowerCase().includes(relFilterText)) return;
     const li = document.createElement('li');
     li.innerHTML = `<span class="${r.type === 'knows' ? 'knows' : r.type}">${a.name} ${relLabels[r.type]} ${b.name}</span>`;
     const btn = document.createElement('button'); btn.className = 'icon'; btn.textContent = '✕'; btn.onclick = () => deleteRel(r.id);
