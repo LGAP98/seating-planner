@@ -855,16 +855,78 @@ function moveFixIsolated() {
   };
 }
 
+function moveRelocateIsolated() {
+  const knowsPairs = buildKnowsIndex();
+  const isolated = [];
+  state.tables.forEach((t, ti) => {
+    const seated = t.seats.filter(Boolean);
+    seated.forEach(id => {
+      if (!seated.some(other => other !== id && knowEachOther(id, other, knowsPairs))) {
+        isolated.push({ id, ti });
+      }
+    });
+  });
+  if (!isolated.length) return null;
+  const pick = isolated[Math.floor(Math.random() * isolated.length)];
+  const guest = guestById(pick.id);
+  if (!guest) return null;
+  const guestGroups = new Set(guest.groups);
+  const emptySlots = [];
+  state.tables.forEach((t, ti) => {
+    if (ti === pick.ti) return;
+    const seated = t.seats.filter(Boolean);
+    const hasGroupmate = seated.some(otherId => {
+      const other = guestById(otherId);
+      return other && other.groups.some(g => guestGroups.has(g));
+    });
+    if (!hasGroupmate) return;
+    t.seats.forEach((v, si) => { if (!v) emptySlots.push({ ti, si }); });
+  });
+  if (!emptySlots.length) return null;
+  const dst = emptySlots[Math.floor(Math.random() * emptySlots.length)];
+  const srcSi = state.tables[pick.ti].seats.indexOf(pick.id);
+  state.tables[pick.ti].seats[srcSi] = null;
+  state.tables[dst.ti].seats[dst.si] = pick.id;
+  return () => {
+    state.tables[dst.ti].seats[dst.si] = null;
+    state.tables[pick.ti].seats[srcSi] = pick.id;
+  };
+}
+
+function moveCycleSwap() {
+  const occupied = [];
+  state.tables.forEach((t, ti) => {
+    t.seats.forEach((id, si) => { if (id) occupied.push({ ti, si, id }); });
+  });
+  if (occupied.length < 3) return null;
+  const i0 = Math.floor(Math.random() * occupied.length);
+  let i1 = Math.floor(Math.random() * occupied.length);
+  if (i1 === i0) return null;
+  let i2 = Math.floor(Math.random() * occupied.length);
+  if (i2 === i0 || i2 === i1) return null;
+  const a = occupied[i0], b = occupied[i1], c = occupied[i2];
+  state.tables[a.ti].seats[a.si] = c.id;
+  state.tables[b.ti].seats[b.si] = a.id;
+  state.tables[c.ti].seats[c.si] = b.id;
+  return () => {
+    state.tables[a.ti].seats[a.si] = a.id;
+    state.tables[b.ti].seats[b.si] = b.id;
+    state.tables[c.ti].seats[c.si] = c.id;
+  };
+}
+
 function randomMoveInPlace() {
   const r = Math.random();
-  if (r < 0.20) return moveSwap();
-  if (r < 0.35) return moveFixIsolated();
-  if (r < 0.47) return movePlaceUnseated();
-  if (r < 0.50) return moveGrowTable();
-  if (r < 0.60) return moveShrinkTable();
-  if (r < 0.64) return moveDeleteEmptyTable();
-  if (r < 0.68) return moveMergeTables();
-  if (r < 0.80) return moveSplitTable();
+  if (r < 0.15) return moveSwap();
+  if (r < 0.27) return moveFixIsolated();
+  if (r < 0.39) return moveRelocateIsolated();
+  if (r < 0.49) return moveCycleSwap();
+  if (r < 0.56) return movePlaceUnseated();
+  if (r < 0.59) return moveGrowTable();
+  if (r < 0.66) return moveShrinkTable();
+  if (r < 0.69) return moveDeleteEmptyTable();
+  if (r < 0.72) return moveMergeTables();
+  if (r < 0.82) return moveSplitTable();
   if (r < 0.94) return moveEjectFromOversized();
   return moveAddTable();
 }
@@ -1017,13 +1079,91 @@ function runSeatingOptimizer(milpSnapshot) {
   }
   const smallSeed = makeSmallTableSeed();
 
+  function makeRoundRobinSeed() {
+    const mustPairs = state.rels.filter(r => r.type === 'must');
+    const allIds = state.guests.map(g => g.id);
+    const parent = new Map(allIds.map(id => [id, id]));
+    function find(x) { while (parent.get(x) !== x) { parent.set(x, parent.get(parent.get(x))); x = parent.get(x); } return x; }
+    mustPairs.forEach(r => { const ra = find(r.a), rb = find(r.b); if (ra !== rb) parent.set(ra, rb); });
+    const byCluster = new Map();
+    allIds.forEach(id => { const k = find(id); if (!byCluster.has(k)) byCluster.set(k, []); byCluster.get(k).push(id); });
+    const clusters = [...byCluster.values()].sort((a, b) => b.length - a.length);
+
+    const tableCap = 6;
+    const numTables = Math.max(1, Math.ceil(allIds.length / tableCap));
+    const bins = Array.from({ length: numTables }, () => []);
+
+    const bigClusters = clusters.filter(c => c.length > 1);
+    const singletons = clusters.filter(c => c.length === 1).map(c => c[0]);
+
+    bigClusters.forEach(cluster => {
+      let best = 0, bestCount = Infinity;
+      bins.forEach((b, i) => { if (b.length < bestCount) { bestCount = b.length; best = i; } });
+      if (bins[best].length + cluster.length <= tableCap) {
+        bins[best].push(...cluster);
+      } else {
+        cluster.forEach((id, ci) => {
+          const ti = (best + ci) % numTables;
+          bins[ti].push(id);
+        });
+      }
+    });
+
+    const groupMembers = new Map();
+    singletons.forEach(id => {
+      const g = guestById(id);
+      if (g) g.groups.forEach(gid => {
+        if (!groupMembers.has(gid)) groupMembers.set(gid, []);
+        groupMembers.get(gid).push(id);
+      });
+    });
+    const groups = [...groupMembers.entries()].sort((a, b) => b[1].length - a[1].length);
+    const placed = new Set(bigClusters.flat());
+
+    groups.forEach(([, members]) => {
+      const unplaced = members.filter(id => !placed.has(id));
+      for (let i = unplaced.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [unplaced[i], unplaced[j]] = [unplaced[j], unplaced[i]];
+      }
+      let ti = Math.floor(Math.random() * numTables);
+      unplaced.forEach(id => {
+        let attempts = numTables;
+        while (bins[ti].length >= tableCap && attempts-- > 0) ti = (ti + 1) % numTables;
+        bins[ti].push(id);
+        placed.add(id);
+        ti = (ti + 1) % numTables;
+      });
+    });
+
+    singletons.filter(id => !placed.has(id)).forEach(id => {
+      let best = 0, bestCount = Infinity;
+      bins.forEach((b, i) => { if (b.length < bestCount) { bestCount = b.length; best = i; } });
+      bins[best].push(id);
+    });
+
+    const tables = bins.filter(b => b.length > 0).map(b => {
+      const linked = Math.max(1, Math.ceil((b.length - 2) / 2));
+      const cap = 2 * linked + 2;
+      return {
+        id: crypto.randomUUID(), name: 'T', linked,
+        seats: b.slice(0, cap).concat(Array(Math.max(0, cap - b.length)).fill(null)),
+        x: 60, y: 60,
+      };
+    });
+    state.tables.length = 0;
+    tables.forEach(t => state.tables.push(t));
+    return cloneAllTables();
+  }
+  const roundRobinSeed = makeRoundRobinSeed();
+
   let milpSeed = null;
   if (milpSnapshot) {
     restoreAllTables(milpSnapshot.map(t => ({ ...t, seats: [...t.seats] })));
     milpSeed = cloneAllTables();
   }
 
-  const RESTARTS = 12, ITERATIONS = 8000;
+  const RESTARTS = 16, ITERATIONS = 8000;
   let bestSnapshot = workingBaseline, bestScore = planScore();
 
   if (milpSeed) {
@@ -1033,8 +1173,9 @@ function runSeatingOptimizer(milpSnapshot) {
   }
 
   for (let r = 0; r < RESTARTS; r++) {
-    if (milpSeed && r < 3) restoreAllTables(milpSeed);
-    else if (r < 5) restoreAllTables(workingBaseline);
+    if (milpSeed && r < 2) restoreAllTables(milpSeed);
+    else if (r < 4) restoreAllTables(workingBaseline);
+    else if (r < 10) restoreAllTables(roundRobinSeed);
     else restoreAllTables(smallSeed);
     hillClimb(ITERATIONS);
     const candidateScore = planScore();
