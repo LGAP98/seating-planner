@@ -605,7 +605,7 @@ function hillClimb(iterations) {
     const newPlan = planScore();
     const newScore = searchScore(newPlan);
     const delta = newScore - currentScore;
-    const temperature = 80 * (1 - i / iterations) + 0.5;
+    const temperature = 150 * (1 - i / iterations) + 1;
     if (delta >= 0 || Math.random() < Math.exp(delta / temperature)) {
       currentScore = newScore;
       if (isBetterPlan(newPlan, bestPlan)) { bestPlan = newPlan; bestSnapshot = cloneAllTables(); }
@@ -662,7 +662,7 @@ function runSeatingOptimizer() {
   }
   const smallSeed = makeSmallTableSeed();
 
-  const RESTARTS = 12, ITERATIONS = 6000;
+  const RESTARTS = 12, ITERATIONS = 8000;
   let bestSnapshot = workingBaseline, bestScore = planScore();
   for (let r = 0; r < RESTARTS; r++) {
     restoreAllTables(r < 2 ? workingBaseline : smallSeed);
