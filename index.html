@@ -40,8 +40,8 @@
     <section>
       <h2>2 · Relationships</h2>
       <div class="row">
-        <select id="relA"></select>
-        <select id="relB"></select>
+        <div class="combobox" id="comboA"><input type="text" placeholder="Person A" autocomplete="off"><div class="combobox-list"></div></div>
+        <div class="combobox" id="comboB"><input type="text" placeholder="Person B" autocomplete="off"><div class="combobox-list"></div></div>
       </div>
       <div class="row">
         <select id="relType">
@@ -51,8 +51,22 @@
         </select>
         <button onclick="addRel()">Add</button>
       </div>
+      <details id="relPaste">
+        <summary class="minor-summary">Paste relationships</summary>
+        <textarea id="relPasteArea" placeholder="One per line: Name A, Name B, type&#10;e.g. Alice, Bob, knows&#10;Types: must / conflict / knows" rows="4"></textarea>
+        <button style="margin-top:4px;width:100%;font-size:12px;" onclick="bulkAddRels()">Add pasted</button>
+      </details>
       <details id="relDetails">
         <summary>Show relationships (<span id="relCount">0</span>)</summary>
+        <div class="rel-controls">
+          <input type="search" id="relFilter" placeholder="Filter…" oninput="renderAll()">
+          <div class="rel-type-tabs">
+            <button class="rel-tab active" data-filter="all" onclick="setRelTab('all')">All</button>
+            <button class="rel-tab" data-filter="must" onclick="setRelTab('must')">Must</button>
+            <button class="rel-tab" data-filter="conflict" onclick="setRelTab('conflict')">Not</button>
+            <button class="rel-tab" data-filter="knows" onclick="setRelTab('knows')">Knows</button>
+          </div>
+        </div>
         <ul class="plain" id="relList"></ul>
       </details>
     </section>
@@ -66,7 +80,7 @@
 
   <div class="main">
     <div class="main-toolbar">
-      <span class="hint">3 · Drag a guest onto a seat (or click a guest, then click a seat) &nbsp;·&nbsp; drag a table's title bar to move it &nbsp;·&nbsp; ctrl/cmd + scroll to zoom in on a table</span>
+      <span class="hint">3 · Drag or click → click to place &nbsp;·&nbsp; shift-click two guests to link &nbsp;·&nbsp; <button class="kbd-help-btn" onclick="toggleKbdHelp()" title="Keyboard shortcuts">?</button></span>
       <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; justify-content:flex-end;">
         <div class="zoom-controls">
           <button onclick="stepZoom(0.8)" title="Zoom out">−</button>

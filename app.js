@@ -42,6 +42,29 @@ function guestById(id) { return state.guests.find(g => g.id === id); }
 function groupById(id) { return state.groups.find(g => g.id === id); }
 function seatedTableOf(guestId) { return state.tables.find(t => t.seats.includes(guestId)); }
 
+// ===== Toast notifications =====
+let toastTimer = null;
+function showToast(msg, undoFn) {
+  dismissToast();
+  const el = document.createElement('div');
+  el.className = 'toast';
+  el.innerHTML = `<span>${msg}</span>`;
+  if (undoFn) {
+    const btn = document.createElement('button');
+    btn.textContent = 'Undo';
+    btn.onclick = () => { dismissToast(); undoFn(); };
+    el.appendChild(btn);
+  }
+  document.body.appendChild(el);
+  requestAnimationFrame(() => el.classList.add('show'));
+  toastTimer = setTimeout(dismissToast, 5000);
+}
+function dismissToast() {
+  clearTimeout(toastTimer);
+  const el = document.querySelector('.toast');
+  if (el) el.remove();
+}
+
 // zoom is a view setting, not plan data — not persisted, resets each session
 let roomZoom = 1;
 const ZOOM_MIN = 0.4, ZOOM_MAX = 3;
@@ -49,10 +72,36 @@ const ZOOM_MIN = 0.4, ZOOM_MAX = 3;
 // zooming in grows seats past this and the full name just appears
 const SEAT_LEGIBLE_PX = 56;
 
+// contextual relationship picker state (used by toggleSelectGuest, defined fully in Relationships section)
+let pairSelectId = null;
+let relPickerEl = null;
+function closeRelPicker() {
+  if (relPickerEl) { relPickerEl.remove(); relPickerEl = null; }
+  if (pairSelectId) { pairSelectId = null; renderAll(); }
+}
+
 // click-to-place: an alternative to drag-and-drop — click a guest, then click a seat (or the
 // empty pool background to unseat). Transient UI state, not persisted.
 let selectedGuestId = null;
-function toggleSelectGuest(id) { selectedGuestId = (selectedGuestId === id) ? null : id; renderAll(); }
+function toggleSelectGuest(id, ev) {
+  if (ev && ev.shiftKey) {
+    ev.stopPropagation();
+    if (!pairSelectId) {
+      pairSelectId = id;
+      renderAll();
+    } else if (pairSelectId === id) {
+      pairSelectId = null;
+      renderAll();
+    } else {
+      showRelPicker(pairSelectId, id, ev.clientX, ev.clientY);
+      pairSelectId = null;
+    }
+    return;
+  }
+  if (pairSelectId) { closeRelPicker(); return; }
+  selectedGuestId = (selectedGuestId === id) ? null : id;
+  renderAll();
+}
 function trySeatSelected(tableId, seatIndex) {
   if (!selectedGuestId) return;
   placeGuest(selectedGuestId, tableId, seatIndex);
@@ -72,7 +121,10 @@ document.addEventListener('drop', e => e.preventDefault());
 document.addEventListener('keydown', e => {
   const mod = e.ctrlKey || e.metaKey;
   if (mod && e.key.toLowerCase() === 'z' && !['INPUT', 'TEXTAREA'].includes(e.target.tagName)) { e.preventDefault(); undo(); }
+  else if (e.key === 'Escape' && document.getElementById('kbdOverlay')) { toggleKbdHelp(); }
+  else if (e.key === 'Escape' && pairSelectId) { closeRelPicker(); }
   else if (e.key === 'Escape' && selectedGuestId) { selectedGuestId = null; renderAll(); }
+  else if (e.key === '?' && !['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName) && !e.target.isContentEditable) { toggleKbdHelp(); }
 });
 
 // ===== Guests =====
@@ -101,21 +153,44 @@ function addGuests() {
 
 function renameGuest(id) {
   const guest = guestById(id);
-  const name = prompt('Rename guest', guest.name);
-  if (!name || !name.trim()) return;
-  guest.name = name.trim();
-  save(); renderAll();
+  const chipEl = document.querySelector(`[data-guest-id="${id}"].chip`);
+  if (!chipEl) { const name = prompt('Rename guest', guest.name); if (!name || !name.trim()) return; guest.name = name.trim(); save(); renderAll(); return; }
+  const nameSpan = chipEl.querySelector('span.name');
+  if (!nameSpan || nameSpan.contentEditable === 'true') return;
+  nameSpan.contentEditable = 'true';
+  nameSpan.focus();
+  const range = document.createRange(); range.selectNodeContents(nameSpan); const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(range);
+  nameSpan.style.cursor = 'text';
+  chipEl.draggable = false;
+  const commit = () => {
+    nameSpan.contentEditable = 'false';
+    nameSpan.style.cursor = '';
+    chipEl.draggable = true;
+    const val = nameSpan.textContent.trim();
+    if (val && val !== guest.name) { guest.name = val; save(); renderAll(); }
+    else { nameSpan.textContent = guest.name; }
+  };
+  nameSpan.onblur = commit;
+  nameSpan.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); nameSpan.blur(); } else if (e.key === 'Escape') { nameSpan.textContent = guest.name; nameSpan.blur(); } };
 }
 
 function deleteGuest(id) {
   const guest = guestById(id);
-  if (!confirm(`Remove ${guest.name} from the guest list? This clears their seat and any relationships involving them.`)) return;
+  const snapshot = JSON.stringify(state);
   if (openGroupPickerState && openGroupPickerState.guestId === id) closeGroupPicker();
   removeGuestFromAllSeats(id);
   state.rels = state.rels.filter(r => r.a !== id && r.b !== id);
   state.guests = state.guests.filter(g => g.id !== id);
   if (selectedGuestId === id) selectedGuestId = null;
   save(); renderAll();
+  showToast(`Removed ${guest.name}`, () => {
+    const restored = JSON.parse(snapshot);
+    state.guests = migrateGuestGroups(restored.guests || []);
+    state.groups = restored.groups || [];
+    state.rels = restored.rels || [];
+    state.tables = migrateTablePositions(restored.tables || []);
+    save(); renderAll();
+  });
 }
 
 // ===== Groups =====
@@ -173,13 +248,221 @@ function openGroupPicker(guestId, anchorEl) {
 
 // ===== Relationships =====
 
+// -- searchable combobox for guest picking --
+const comboState = { A: { selectedId: null }, B: { selectedId: null } };
+
+function initCombobox(wrapperId, key) {
+  const wrap = document.getElementById(wrapperId);
+  const input = wrap.querySelector('input');
+  const list = wrap.querySelector('.combobox-list');
+  let activeIndex = -1;
+
+  function open() { wrap.classList.add('open'); refreshList(); }
+  function close() { wrap.classList.remove('open'); activeIndex = -1; }
+
+  function refreshList() {
+    const q = input.value.trim().toLowerCase();
+    const otherId = key === 'A' ? comboState.B.selectedId : comboState.A.selectedId;
+    let matches = state.guests;
+    if (q && !comboState[key].selectedId) matches = matches.filter(g => g.name.toLowerCase().includes(q));
+    list.innerHTML = '';
+    if (!matches.length) { list.innerHTML = '<div class="combobox-empty">No matches</div>'; return; }
+
+    const grouped = new Map();
+    matches.forEach(g => {
+      const groupNames = g.groups.map(id => groupById(id)).filter(Boolean).map(gr => gr.name);
+      const label = groupNames.length ? groupNames.join(', ') : '';
+      if (!grouped.has(label)) grouped.set(label, []);
+      grouped.get(label).push(g);
+    });
+
+    let idx = 0;
+    for (const [groupLabel, guests] of grouped) {
+      guests.forEach(g => {
+        const item = document.createElement('div');
+        item.className = 'combobox-item' + (idx === activeIndex ? ' active' : '');
+        if (g.id === otherId) { item.style.opacity = '0.4'; item.title = 'Already selected as the other person'; }
+        const dots = g.groups.map(id => groupById(id)).filter(Boolean)
+          .slice(0, 3).map(gr => `<span class="dot" style="background:${gr.color}"></span>`).join('');
+        item.innerHTML = (dots ? `<span class="cb-dots">${dots}</span>` : '') + g.name;
+        const gId = g.id;
+        item.onmousedown = e => { e.preventDefault(); select(gId, g.name); };
+        list.appendChild(item);
+        idx++;
+      });
+    }
+  }
+
+  function select(id, name) {
+    comboState[key].selectedId = id;
+    input.value = name;
+    input.classList.add('has-value');
+    close();
+  }
+
+  function clearSelection() {
+    comboState[key].selectedId = null;
+    input.classList.remove('has-value');
+  }
+
+  input.addEventListener('focus', () => { if (!comboState[key].selectedId) open(); });
+  input.addEventListener('input', () => { clearSelection(); open(); });
+  input.addEventListener('keydown', e => {
+    const items = list.querySelectorAll('.combobox-item');
+    if (e.key === 'ArrowDown') { e.preventDefault(); activeIndex = Math.min(activeIndex + 1, items.length - 1); refreshList(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); activeIndex = Math.max(activeIndex - 1, 0); refreshList(); }
+    else if (e.key === 'Enter' && activeIndex >= 0 && items[activeIndex]) {
+      e.preventDefault();
+      items[activeIndex].onmousedown(e);
+    }
+    else if (e.key === 'Escape') { close(); input.blur(); }
+    else if (e.key === 'Backspace' && comboState[key].selectedId) { clearSelection(); input.value = ''; open(); }
+  });
+
+  // click on the input when a value is already selected: re-open to allow changing
+  input.addEventListener('mousedown', () => {
+    if (comboState[key].selectedId) { clearSelection(); input.value = ''; setTimeout(open, 0); }
+  });
+
+  document.addEventListener('mousedown', e => { if (!wrap.contains(e.target)) close(); }, true);
+}
+initCombobox('comboA', 'A');
+initCombobox('comboB', 'B');
+
 function addRel() {
-  const a = document.getElementById('relA').value, b = document.getElementById('relB').value;
+  const a = comboState.A.selectedId, b = comboState.B.selectedId;
+  const type = document.getElementById('relType').value;
   if (!a || !b || a === b) return;
-  state.rels.push({ id: crypto.randomUUID(), a, b, type: document.getElementById('relType').value });
+  if (isDuplicateRel(a, b, type)) return;
+  state.rels.push({ id: crypto.randomUUID(), a, b, type });
+  comboState.A.selectedId = null; comboState.B.selectedId = null;
+  document.querySelector('#comboA input').value = '';
+  document.querySelector('#comboB input').value = '';
+  document.querySelector('#comboA input').classList.remove('has-value');
+  document.querySelector('#comboB input').classList.remove('has-value');
   save(); renderAll();
 }
-function deleteRel(id) { state.rels = state.rels.filter(r => r.id !== id); save(); renderAll(); }
+
+function isDuplicateRel(a, b, type) {
+  return state.rels.some(r => r.type === type && ((r.a === a && r.b === b) || (r.a === b && r.b === a)));
+}
+
+function bulkAddRels() {
+  const text = document.getElementById('relPasteArea').value;
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  if (!lines.length) return;
+  const nameIndex = new Map();
+  state.guests.forEach(g => nameIndex.set(g.name.toLowerCase(), g.id));
+  const typeAliases = { must: 'must', conflict: 'conflict', knows: 'knows', 'must not': 'conflict', mustnot: 'conflict' };
+  let added = 0, skipped = [];
+  lines.forEach((line, i) => {
+    const parts = line.split(/[,;\t]+/).map(s => s.trim());
+    if (parts.length < 2) { skipped.push(`Line ${i+1}: need at least two names`); return; }
+    const nameA = parts[0], nameB = parts[1];
+    const typeStr = (parts[2] || 'knows').toLowerCase();
+    const type = typeAliases[typeStr];
+    if (!type) { skipped.push(`Line ${i+1}: unknown type "${parts[2]}"`); return; }
+    const idA = nameIndex.get(nameA.toLowerCase()), idB = nameIndex.get(nameB.toLowerCase());
+    if (!idA) { skipped.push(`Line ${i+1}: "${nameA}" not found`); return; }
+    if (!idB) { skipped.push(`Line ${i+1}: "${nameB}" not found`); return; }
+    if (idA === idB) { skipped.push(`Line ${i+1}: same person`); return; }
+    if (isDuplicateRel(idA, idB, type)) { skipped.push(`Line ${i+1}: duplicate`); return; }
+    state.rels.push({ id: crypto.randomUUID(), a: idA, b: idB, type });
+    added++;
+  });
+  document.getElementById('relPasteArea').value = '';
+  save(); renderAll();
+  const msg = `Added ${added} relationship${added !== 1 ? 's' : ''}` + (skipped.length ? ` · ${skipped.length} skipped` : '');
+  showToast(msg);
+  if (skipped.length) console.warn('Bulk relationship import skipped lines:', skipped);
+}
+
+function deleteRel(id) {
+  const rel = state.rels.find(r => r.id === id);
+  const a = guestById(rel?.a), b = guestById(rel?.b);
+  state.rels = state.rels.filter(r => r.id !== id);
+  save(); renderAll();
+  if (a && b) showToast(`Removed ${a.name} — ${b.name} relationship`, () => { state.rels.push(rel); save(); renderAll(); });
+}
+
+let activeRelTab = 'all';
+function setRelTab(type) {
+  activeRelTab = type;
+  document.querySelectorAll('.rel-tab').forEach(b => b.classList.toggle('active', b.dataset.filter === type));
+  renderAll();
+}
+
+function showRelPicker(guestA, guestB, anchorX, anchorY) {
+  closeRelPicker();
+  const panel = document.createElement('div');
+  panel.className = 'rel-picker';
+  const nameA = guestById(guestA).name, nameB = guestById(guestB).name;
+  panel.innerHTML = `<div class="rp-header">${nameA} & ${nameB}</div>`;
+  [
+    { type: 'must', label: '↔ Must sit together' },
+    { type: 'conflict', label: '⚡ Must NOT sit together' },
+    { type: 'knows', label: '~ Know each other' }
+  ].forEach(opt => {
+    const btn = document.createElement('button');
+    btn.textContent = opt.label;
+    if (isDuplicateRel(guestA, guestB, opt.type)) {
+      btn.style.opacity = '0.4';
+      btn.title = 'Already added';
+      btn.onclick = () => {};
+    } else {
+      btn.onclick = () => {
+        state.rels.push({ id: crypto.randomUUID(), a: guestA, b: guestB, type: opt.type });
+        save();
+        closeRelPicker();
+        renderAll();
+      };
+    }
+    panel.appendChild(btn);
+  });
+  document.body.appendChild(panel);
+
+  const pw = panel.offsetWidth, ph = panel.offsetHeight;
+  const left = Math.max(8, Math.min(anchorX, window.innerWidth - pw - 8));
+  const top = Math.max(8, Math.min(anchorY, window.innerHeight - ph - 8));
+  panel.style.left = left + 'px';
+  panel.style.top = top + 'px';
+  relPickerEl = panel;
+
+  setTimeout(() => {
+    const onOutside = e => { if (!panel.contains(e.target)) { closeRelPicker(); document.removeEventListener('mousedown', onOutside, true); } };
+    document.addEventListener('mousedown', onOutside, true);
+  }, 0);
+}
+
+// -- relationship hover highlighting --
+function highlightRelated(guestId) {
+  const guest = guestById(guestId);
+  const related = new Map();
+  state.rels.forEach(r => {
+    if (r.a === guestId) related.set(r.b, r.type);
+    else if (r.b === guestId) related.set(r.a, r.type);
+  });
+  const sameGroup = new Set();
+  if (guest && guest.groups.length) {
+    state.guests.forEach(g => {
+      if (g.id !== guestId && g.groups.some(grp => guest.groups.includes(grp))) sameGroup.add(g.id);
+    });
+  }
+  if (!related.size && !sameGroup.size) return;
+  document.querySelectorAll('[data-guest-id]').forEach(el => {
+    const id = el.dataset.guestId;
+    if (id === guestId) return;
+    const type = related.get(id);
+    if (type) el.classList.add('rel-highlight', 'rel-' + type);
+    else if (sameGroup.has(id)) el.classList.add('rel-highlight', 'rel-group');
+    else el.classList.add('rel-dimmed');
+  });
+}
+function clearHighlights() {
+  document.querySelectorAll('.rel-highlight,.rel-dimmed').forEach(el => {
+    el.classList.remove('rel-highlight', 'rel-must', 'rel-conflict', 'rel-knows', 'rel-group', 'rel-dimmed');
+  });
+}
 
 function unmetMustPairs() {
   return state.rels.filter(r => r.type === 'must').filter(r => {
@@ -891,6 +1174,37 @@ async function suggestBetterPlan() {
 
 // ===== Whole-plan reset / share =====
 
+// ===== Keyboard shortcut help =====
+
+function toggleKbdHelp() {
+  let overlay = document.getElementById('kbdOverlay');
+  if (overlay) { overlay.remove(); return; }
+  overlay = document.createElement('div');
+  overlay.id = 'kbdOverlay';
+  overlay.className = 'kbd-overlay';
+  overlay.innerHTML = `
+    <div class="kbd-panel">
+      <div class="kbd-header"><b>Keyboard shortcuts & interactions</b><button class="icon" onclick="toggleKbdHelp()">✕</button></div>
+      <div class="kbd-grid">
+        <div class="kbd-section">
+          <div class="kbd-title">Keyboard</div>
+          <div class="kbd-row"><kbd>Ctrl/⌘ Z</kbd><span>Undo last action</span></div>
+          <div class="kbd-row"><kbd>Escape</kbd><span>Cancel selection / close popover</span></div>
+          <div class="kbd-row"><kbd>Ctrl/⌘ Scroll</kbd><span>Zoom in/out on the room</span></div>
+        </div>
+        <div class="kbd-section">
+          <div class="kbd-title">Guest interactions</div>
+          <div class="kbd-row"><kbd>Click</kbd><span>Select guest, then click a seat to place</span></div>
+          <div class="kbd-row"><kbd>Double-click</kbd><span>Rename guest in place</span></div>
+          <div class="kbd-row"><kbd>Shift-click</kbd><span>Select two guests to add a relationship</span></div>
+          <div class="kbd-row"><kbd>Drag</kbd><span>Move guest to a seat or back to pool</span></div>
+        </div>
+      </div>
+    </div>`;
+  overlay.onclick = e => { if (e.target === overlay) toggleKbdHelp(); };
+  document.body.appendChild(overlay);
+}
+
 function resetAll() {
   if (!confirm('Clear all guests, groups, relationships and tables? This cannot be undone.')) return;
   state.guests = []; state.groups = []; state.rels = []; state.tables = [];
@@ -932,12 +1246,12 @@ function importJson(ev) {
 
 // ===== Tables & seating =====
 
-function tableCapacity(t) { return 2 * t.linked + 2; }
+function tableCapacity(t) { return t.headTable ? 2 * t.linked : 2 * t.linked + 2; }
 // stack new tables below whatever's already there so a wide "linked" table never overlaps the next one
 function pushNewTable() {
   const n = state.tables.length;
-  const y = state.tables.length ? Math.max(...state.tables.map(t => t.y + tableFootprint(t.linked).height)) + 50 : 40;
-  state.tables.push({ id: crypto.randomUUID(), name: 'Table ' + (n + 1), linked: 1, seats: [null, null, null, null], x: 40, y });
+  const y = state.tables.length ? Math.max(...state.tables.map(t => t.y + tableFootprint(t.linked).height)) + 60 : 60;
+  state.tables.push({ id: crypto.randomUUID(), name: 'Table ' + (n + 1), linked: 1, seats: [null, null, null, null], x: 60, y });
 }
 function addTable() { pushNewTable(); save(); renderAll(); }
 
@@ -947,7 +1261,7 @@ function addTable() { pushNewTable(); save(); renderAll(); }
 // the survivors relative to each other).
 function arrangeTables() {
   if (!state.tables.length) return;
-  const margin = 40, gapX = 40, gapY = 70;
+  const margin = 60, gapX = 60, gapY = 90;
   const room = document.getElementById('room');
   const rowWidth = Math.max(700, room.clientWidth - margin * 2);
   let x = margin, y = margin, rowHeight = 0;
@@ -968,14 +1282,23 @@ function arrangeTables() {
 function deleteTable(id) {
   const t = state.tables.find(t => t.id === id);
   const seatedCount = t.seats.filter(Boolean).length;
-  if (seatedCount && !confirm(`Remove ${t.name}? ${seatedCount} seated guest(s) will move back to Unseated.`)) return;
+  const snapshot = JSON.stringify(state);
   state.tables = state.tables.filter(t => t.id !== id);
   save(); renderAll();
+  const msg = seatedCount ? `Removed ${t.name} — ${seatedCount} guest(s) unseated` : `Removed ${t.name}`;
+  showToast(msg, () => {
+    const restored = JSON.parse(snapshot);
+    state.guests = migrateGuestGroups(restored.guests || []);
+    state.groups = restored.groups || [];
+    state.rels = restored.rels || [];
+    state.tables = migrateTablePositions(restored.tables || []);
+    save(); renderAll();
+  });
 }
 function setTableLinked(id, linked) {
   const t = state.tables.find(t => t.id === id);
   linked = Math.max(1, parseInt(linked) || 1);
-  const newCap = 2 * linked + 2;
+  const newCap = t.headTable ? 2 * linked : 2 * linked + 2;
   const seatedGuests = t.seats.filter(Boolean);
   const overflow = seatedGuests.length - newCap;
   // shrinking below the seated count used to leave the extra guests in the array at seat
@@ -993,6 +1316,20 @@ function setTableLinked(id, linked) {
 function setTableName(id, name) {
   state.tables.find(t => t.id === id).name = name;
   save();
+}
+function toggleHeadTable(id) {
+  const t = state.tables.find(t => t.id === id);
+  const wasHead = !!t.headTable;
+  t.headTable = !wasHead;
+  const newCap = tableCapacity(t);
+  const seated = t.seats.filter(Boolean);
+  if (wasHead) {
+    t.seats = seated.slice(0, newCap).concat(Array(Math.max(0, newCap - seated.length)).fill(null));
+  } else {
+    const keep = seated.slice(0, newCap);
+    t.seats = keep.concat(Array(Math.max(0, newCap - keep.length)).fill(null));
+  }
+  save(); renderAll();
 }
 
 function removeGuestFromAllSeats(guestId) {
@@ -1021,8 +1358,13 @@ function dropOnPool(ev) {
 // (interactive, via roomZoom) — same geometry math either way.
 const SQ = 82, PAD = 46, SEAT_W = 68, SEAT_H = 34, SEAT_W2 = 34, SEAT_H2 = 60;
 function tableFootprint(n, scale = 1) { return { width: n * SQ * scale + PAD * scale * 2, height: SQ * scale + PAD * scale * 2 }; }
-function seatRect(n, idx, scale = 1) {
+function seatRect(n, idx, scale = 1, headTable = false) {
   const sq = SQ * scale, pad = PAD * scale, sw = SEAT_W * scale, sh = SEAT_H * scale, sw2 = SEAT_W2 * scale, sh2 = SEAT_H2 * scale, gap = 6 * scale;
+  if (headTable) {
+    if (idx < n) return { left: pad + idx * sq + (sq - sw) / 2, top: pad - sh - gap, width: sw, height: sh };
+    const i = idx - n;
+    return { left: pad + i * sq + (sq - sw) / 2, top: pad + sq + gap, width: sw, height: sh };
+  }
   if (idx < n) return { left: pad + idx * sq + (sq - sw) / 2, top: pad - sh - gap, width: sw, height: sh };
   if (idx < 2 * n) { const i = idx - n; return { left: pad + i * sq + (sq - sw) / 2, top: pad + sq + gap, width: sw, height: sh }; }
   if (idx === 2 * n) return { left: pad - sw2 - gap, top: pad + (sq - sh2) / 2, width: sw2, height: sh2 };
@@ -1036,13 +1378,13 @@ function initials(name) {
   return parts.length > 1 ? (parts[0][0] + parts[parts.length - 1][0]).toUpperCase() : name.slice(0, 2).toUpperCase();
 }
 
-function makeGroupsBtn(guest, extraClass) {
+function makeGroupsBtn(guest, extraClass, maxDots = 3) {
   const groupsBtn = document.createElement('span');
   groupsBtn.className = 'group-dots' + (extraClass ? ' ' + extraClass : '');
   groupsBtn.title = 'Edit groups';
   const gs = guest.groups.map(id => groupById(id)).filter(Boolean);
   groupsBtn.innerHTML = gs.length
-    ? gs.slice(0, 3).map(g => `<span class="dot" style="background:${g.color}"></span>`).join('') + (gs.length > 3 ? `<span class="more">+${gs.length - 3}</span>` : '')
+    ? gs.slice(0, maxDots).map(g => `<span class="dot" style="background:${g.color}"></span>`).join('') + (gs.length > maxDots ? `<span class="more">+${gs.length - maxDots}</span>` : '')
     : `<span class="dot-empty">+</span>`;
   groupsBtn.onclick = e => { e.stopPropagation(); openGroupPicker(guest.id, groupsBtn); };
   return groupsBtn;
@@ -1059,15 +1401,19 @@ function makeDeleteBtn(guest, extraClass) {
 
 // avatarMode: seat is too narrow for a full name (physically-narrow end seats, or zoomed way out) —
 // show initials in a circle instead, full name revealed on hover via pure-CSS tooltip
-function chip(guest, avatarMode) {
+function chip(guest, avatarMode, inSeat) {
   if (avatarMode) {
     const el = document.createElement('div');
-    el.className = 'avatar-wrap' + (guest.id === selectedGuestId ? ' selected' : '');
+    el.className = 'avatar-wrap' + (guest.id === selectedGuestId ? ' selected' : '') + (guest.id === pairSelectId ? ' selected-pair' : '');
+    el.dataset.guestId = guest.id;
     el.draggable = true;
-    el.title = guest.name + ' (click to pick up, double-click to rename)';
+    el.title = guest.name + ' (click to pick up, double-click to rename, shift-click to link)';
     el.ondragstart = e => e.dataTransfer.setData('text/plain', guest.id);
     el.ondblclick = () => renameGuest(guest.id);
-    el.onclick = e => { e.stopPropagation(); toggleSelectGuest(guest.id); };
+    el.addEventListener('click', e => { if (e.shiftKey) { e.stopPropagation(); e.stopImmediatePropagation(); toggleSelectGuest(guest.id, e); } }, true);
+    el.onclick = e => { e.stopPropagation(); toggleSelectGuest(guest.id, e); };
+    el.onmouseenter = () => highlightRelated(guest.id);
+    el.onmouseleave = clearHighlights;
 
     const circle = document.createElement('div');
     circle.className = 'avatar-circle';
@@ -1079,24 +1425,29 @@ function chip(guest, avatarMode) {
     tip.textContent = guest.name;
     el.appendChild(tip);
 
-    el.appendChild(makeGroupsBtn(guest, 'avatar-badge'));
+    el.appendChild(makeGroupsBtn(guest, 'avatar-badge', 2));
     el.appendChild(makeDeleteBtn(guest, 'avatar-del'));
     return el;
   }
 
+  const dotMax = inSeat ? 2 : 3;
   const el = document.createElement('div');
-  el.className = 'chip' + (guest.id === selectedGuestId ? ' selected' : '');
+  el.className = 'chip' + (guest.id === selectedGuestId ? ' selected' : '') + (guest.id === pairSelectId ? ' selected-pair' : '');
+  el.dataset.guestId = guest.id;
   el.draggable = true;
-  el.title = guest.name + ' (click to pick up, double-click to rename)';
+  el.title = guest.name + ' (click to pick up, double-click to rename, shift-click to link)';
   el.ondragstart = e => e.dataTransfer.setData('text/plain', guest.id);
-  el.ondblclick = () => renameGuest(guest.id);
-  el.onclick = e => { e.stopPropagation(); toggleSelectGuest(guest.id); };
+  el.ondblclick = e => { e.stopPropagation(); renameGuest(guest.id); };
+  el.addEventListener('click', e => { if (e.shiftKey) { e.stopPropagation(); e.stopImmediatePropagation(); toggleSelectGuest(guest.id, e); } }, true);
+  el.onclick = e => { e.stopPropagation(); toggleSelectGuest(guest.id, e); };
+  el.onmouseenter = () => highlightRelated(guest.id);
+  el.onmouseleave = clearHighlights;
 
   const label = document.createElement('span');
   label.className = 'name';
   label.textContent = guest.name;
   el.appendChild(label);
-  el.appendChild(makeGroupsBtn(guest));
+  el.appendChild(makeGroupsBtn(guest, '', dotMax));
   el.appendChild(makeDeleteBtn(guest, 'chip-del'));
 
   return el;
@@ -1178,19 +1529,19 @@ function renderAll() {
     gl.appendChild(li);
   });
 
-  // rel selects
-  const opts = state.guests.map(g => `<option value="${g.id}">${g.name}</option>`).join('');
-  document.getElementById('relA').innerHTML = opts;
-  document.getElementById('relB').innerHTML = opts;
-
-  // rel list
+  // rel list (filterable by name and type)
   document.getElementById('relCount').textContent = state.rels.length;
   const relLabels = { must: '↔ must sit with', conflict: '⚡ must NOT sit with', knows: '~ knows' };
+  const relFilterText = (document.getElementById('relFilter')?.value || '').trim().toLowerCase();
   const rl = document.getElementById('relList');
   rl.innerHTML = '';
-  state.rels.forEach(r => {
+  const typeOrder = ['must', 'conflict', 'knows'];
+  const sorted = [...state.rels].sort((a, b) => typeOrder.indexOf(a.type) - typeOrder.indexOf(b.type));
+  sorted.forEach(r => {
+    if (activeRelTab !== 'all' && r.type !== activeRelTab) return;
     const a = guestById(r.a), b = guestById(r.b);
     if (!a || !b) return;
+    if (relFilterText && !a.name.toLowerCase().includes(relFilterText) && !b.name.toLowerCase().includes(relFilterText)) return;
     const li = document.createElement('li');
     li.innerHTML = `<span class="${r.type === 'knows' ? 'knows' : r.type}">${a.name} ${relLabels[r.type]} ${b.name}</span>`;
     const btn = document.createElement('button'); btn.className = 'icon'; btn.textContent = '✕'; btn.onclick = () => deleteRel(r.id);
@@ -1243,7 +1594,9 @@ function renderAll() {
     const handle = document.createElement('div');
     handle.className = 'table-handle';
     const cap = tableCapacity(t);
+    const headActive = t.headTable ? ' active' : '';
     handle.innerHTML = `<span class="grip" title="drag to move">⠿</span>
+      <button class="head-toggle${headActive}" onclick="toggleHeadTable('${t.id}')" title="${t.headTable ? 'Switch to standard table (with side seats)' : 'Switch to head table (no side seats)'}">⊟</button>
       <input class="name-input" value="${t.name}" onchange="setTableName('${t.id}',this.value)">
       <span class="cap">🔗<input type="number" class="linked-input" min="1" value="${t.linked}" onchange="setTableLinked('${t.id}',this.value)">= ${cap} seats</span>
       <button class="icon" title="Remove table">✕</button>`;
@@ -1259,7 +1612,7 @@ function renderAll() {
     wrapper.appendChild(surface);
 
     t.seats.forEach((guestId, i) => {
-      const r = seatRect(n, i, roomZoom);
+      const r = seatRect(n, i, roomZoom, !!t.headTable);
       const seat = document.createElement('div');
       seat.className = 'seat';
       seat.style.left = r.left + 'px'; seat.style.top = r.top + 'px';
@@ -1268,7 +1621,7 @@ function renderAll() {
       seat.ondragleave = () => seat.classList.remove('dragover');
       seat.ondrop = e => { e.preventDefault(); seat.classList.remove('dragover'); placeGuest(e.dataTransfer.getData('text/plain'), t.id, i); };
       seat.onclick = () => trySeatSelected(t.id, i);
-      if (guestId) { const g = guestById(guestId); if (g) seat.appendChild(chip(g, r.width < SEAT_LEGIBLE_PX)); }
+      if (guestId) { const g = guestById(guestId); if (g) seat.appendChild(chip(g, r.width < SEAT_LEGIBLE_PX, true)); }
       wrapper.appendChild(seat);
     });
 
@@ -1348,7 +1701,7 @@ function exportPng() {
     fillEllipsizedText(ctx, `${t.name} · ${tableCapacity(t)} seats`, ox + fp.width / 2, oy - 10, fp.width);
 
     t.seats.forEach((guestId, i) => {
-      const r = seatRect(n, i, LAYOUT_SCALE);
+      const r = seatRect(n, i, LAYOUT_SCALE, !!t.headTable);
       roundRectPath(ctx, ox + r.left, oy + r.top, r.width, r.height, 8);
       ctx.fillStyle = bg; ctx.fill();
       ctx.setLineDash([4, 3]); ctx.lineWidth = 1.5; ctx.strokeStyle = border; ctx.stroke(); ctx.setLineDash([]);
