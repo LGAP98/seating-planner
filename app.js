@@ -520,8 +520,8 @@ function tableScoreDetail(table, knowsPairs) {
 }
 
 // returns null finalScore when nobody's seated yet — there's nothing meaningful to grade.
-function planScore() {
-  const knowsPairs = buildKnowsIndex();
+function planScore(cachedKnowsPairs) {
+  const knowsPairs = cachedKnowsPairs || buildKnowsIndex();
   const details = state.tables
     .map(t => ({ table: t, detail: tableScoreDetail(t, knowsPairs) }))
     .filter(d => d.detail);
@@ -813,8 +813,8 @@ function moveEjectFromOversized() {
   return () => { state.tables[dstTi].seats[dstSi] = null; t.seats[srcSi] = guestId; };
 }
 
-function moveFixIsolated() {
-  const knowsPairs = buildKnowsIndex();
+function moveFixIsolated(cachedKnowsPairs) {
+  const knowsPairs = cachedKnowsPairs || buildKnowsIndex();
   const isolated = [];
   state.tables.forEach((t, ti) => {
     const seated = t.seats.filter(Boolean);
@@ -855,8 +855,8 @@ function moveFixIsolated() {
   };
 }
 
-function moveRelocateIsolated() {
-  const knowsPairs = buildKnowsIndex();
+function moveRelocateIsolated(cachedKnowsPairs) {
+  const knowsPairs = cachedKnowsPairs || buildKnowsIndex();
   const isolated = [];
   state.tables.forEach((t, ti) => {
     const seated = t.seats.filter(Boolean);
@@ -915,11 +915,11 @@ function moveCycleSwap() {
   };
 }
 
-function randomMoveInPlace() {
+function randomMoveInPlace(knowsPairs) {
   const r = Math.random();
   if (r < 0.15) return moveSwap();
-  if (r < 0.27) return moveFixIsolated();
-  if (r < 0.39) return moveRelocateIsolated();
+  if (r < 0.27) return moveFixIsolated(knowsPairs);
+  if (r < 0.39) return moveRelocateIsolated(knowsPairs);
   if (r < 0.49) return moveCycleSwap();
   if (r < 0.56) return movePlaceUnseated();
   if (r < 0.59) return moveGrowTable();
@@ -1014,14 +1014,16 @@ function greedySeatEveryone() {
 // so early on (temperature high) we sometimes accept a worse move to escape it, cooling toward
 // pure-greedy by the end. The best state seen at any point is tracked separately and restored
 // at the end, since the annealed "current" state can wander below it.
-function hillClimb(iterations) {
-  let currentScore = searchScore(planScore());
-  let bestPlan = planScore(); // full object, so "best" is judged by isBetterPlan (violations dominate), not the raw scalar used for SA acceptance
+async function hillClimb(iterations) {
+  const knowsPairs = buildKnowsIndex();
+  let currentScore = searchScore(planScore(knowsPairs));
+  let bestPlan = planScore(knowsPairs);
   let bestSnapshot = cloneAllTables();
   for (let i = 0; i < iterations; i++) {
-    const undo = randomMoveInPlace();
+    if (i % 400 === 0 && i > 0) await new Promise(r => setTimeout(r, 0));
+    const undo = randomMoveInPlace(knowsPairs);
     if (!undo) continue;
-    const newPlan = planScore();
+    const newPlan = planScore(knowsPairs);
     const newScore = searchScore(newPlan);
     const delta = newScore - currentScore;
     const temperature = 60 * (1 - i / iterations) + 0.5;
@@ -1035,7 +1037,7 @@ function hillClimb(iterations) {
   restoreAllTables(bestSnapshot);
 }
 
-function runSeatingOptimizer(milpSnapshot) {
+async function runSeatingOptimizer(milpSnapshot) {
   const trueOriginalSnapshot = cloneAllTables();
   const trueOriginalScore = planScore();
   if (!state.guests.length) { alert('Add some guests first — there\'s nothing to seat yet.'); return; }
@@ -1163,7 +1165,7 @@ function runSeatingOptimizer(milpSnapshot) {
     milpSeed = cloneAllTables();
   }
 
-  const RESTARTS = 16, ITERATIONS = 8000;
+  const RESTARTS = 10, ITERATIONS = 5000;
   let bestSnapshot = workingBaseline, bestScore = planScore();
 
   if (milpSeed) {
@@ -1174,10 +1176,10 @@ function runSeatingOptimizer(milpSnapshot) {
 
   for (let r = 0; r < RESTARTS; r++) {
     if (milpSeed && r < 2) restoreAllTables(milpSeed);
-    else if (r < 4) restoreAllTables(workingBaseline);
-    else if (r < 10) restoreAllTables(roundRobinSeed);
+    else if (r < 3) restoreAllTables(workingBaseline);
+    else if (r < 7) restoreAllTables(roundRobinSeed);
     else restoreAllTables(smallSeed);
-    hillClimb(ITERATIONS);
+    await hillClimb(ITERATIONS);
     const candidateScore = planScore();
     if (isBetterPlan(candidateScore, bestScore)) { bestScore = candidateScore; bestSnapshot = cloneAllTables(); }
   }
@@ -1378,7 +1380,7 @@ async function suggestBetterPlan() {
 
     btn.textContent = 'Optimizing…';
     await new Promise(r => setTimeout(r, 20));
-    runSeatingOptimizer(milpSnapshot);
+    await runSeatingOptimizer(milpSnapshot);
   } finally {
     btn.disabled = false;
     btn.textContent = '✨ Suggest better plan';
