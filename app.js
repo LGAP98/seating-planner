@@ -556,19 +556,29 @@ function planScore() {
 // tells it not to (a set of near-empty tables can score just as "perfect" as two tidy ones).
 function searchScore(s) {
   let tableSizePressure = 0;
-  const mustIds = new Set();
-  state.rels.filter(r => r.type === 'must').forEach(r => { mustIds.add(r.a); mustIds.add(r.b); });
+  const mustClusterMin = mustClusterMinSize();
   state.tables.forEach(t => {
-    const seated = t.seats.filter(Boolean);
-    const k = seated.length;
+    const k = t.seats.filter(Boolean).length;
     if (k === 0) return;
-    const hasMust = seated.some(id => mustIds.has(id));
-    if (hasMust) return;
     if (k <= 6) tableSizePressure += 4;
     else if (k <= 8) tableSizePressure += 1;
+    else if (k <= mustClusterMin) tableSizePressure -= 2;
     else tableSizePressure -= (k - 6) * (k - 6);
   });
   return (s.finalScore ?? -1) + 3 * s.seatedCount - 0.5 * s.emptySeats - 0.5 * s.tableCount + tableSizePressure;
+}
+
+function mustClusterMinSize() {
+  const mustPairs = state.rels.filter(r => r.type === 'must');
+  if (!mustPairs.length) return 0;
+  const ids = new Set();
+  mustPairs.forEach(r => { ids.add(r.a); ids.add(r.b); });
+  const parent = new Map([...ids].map(id => [id, id]));
+  function find(x) { while (parent.get(x) !== x) { parent.set(x, parent.get(parent.get(x))); x = parent.get(x); } return x; }
+  mustPairs.forEach(r => { const ra = find(r.a), rb = find(r.b); if (ra !== rb) parent.set(ra, rb); });
+  const sizes = new Map();
+  ids.forEach(id => { const r = find(id); sizes.set(r, (sizes.get(r) || 0) + 1); });
+  return Math.max(...sizes.values());
 }
 
 // Violation count is compared FIRST, strictly — not just folded into the point score. A flat point
@@ -668,7 +678,7 @@ function movePlaceUnseated() {
 function moveGrowTable() {
   if (!state.tables.length) return null;
   const t = state.tables[Math.floor(Math.random() * state.tables.length)];
-  if (t.linked >= MAX_LINKED) return null;
+  if (t.linked >= MAX_LINKED || tableCapacity(t) >= 8) return null;
   const oldLinked = t.linked, oldSeats = t.seats.slice();
   t.linked += 1;
   t.seats = oldSeats.concat([null, null]); // +1 linked table = +2 seats (one more on each long side)
@@ -721,6 +731,7 @@ function moveMergeTables() {
   const newLinked = tableA.linked + tableB.linked;
   if (newLinked > MAX_LINKED) return null;
   const newCap = 2 * newLinked + 2;
+  if (newCap > 8) return null;
   const combinedSeated = tableA.seats.filter(Boolean).concat(tableB.seats.filter(Boolean));
   if (combinedSeated.length > newCap) return null; // would lose more seats than are spare — not allowed
 
