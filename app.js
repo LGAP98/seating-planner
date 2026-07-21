@@ -813,15 +813,58 @@ function moveEjectFromOversized() {
   return () => { state.tables[dstTi].seats[dstSi] = null; t.seats[srcSi] = guestId; };
 }
 
+function moveFixIsolated() {
+  const knowsPairs = buildKnowsIndex();
+  const isolated = [];
+  state.tables.forEach((t, ti) => {
+    const seated = t.seats.filter(Boolean);
+    seated.forEach(id => {
+      const knows = seated.some(other => other !== id && knowEachOther(id, other, knowsPairs));
+      if (!knows) isolated.push({ id, ti });
+    });
+  });
+  if (!isolated.length) return null;
+  const pick = isolated[Math.floor(Math.random() * isolated.length)];
+  const guest = guestById(pick.id);
+  if (!guest) return null;
+  const guestGroups = new Set(guest.groups);
+  const candidates = [];
+  state.tables.forEach((t, ti) => {
+    if (ti === pick.ti) return;
+    const seated = t.seats.filter(Boolean);
+    const hasGroupmate = seated.some(otherId => {
+      const other = guestById(otherId);
+      return other && other.groups.some(g => guestGroups.has(g));
+    });
+    if (!hasGroupmate) return;
+    seated.forEach((otherId, si) => {
+      if (!otherId) return;
+      const otherGuest = guestById(otherId);
+      const otherHasLocalFriends = seated.some(x => x && x !== otherId && knowEachOther(otherId, x, knowsPairs));
+      if (otherHasLocalFriends) candidates.push({ ti, si, otherId });
+    });
+  });
+  if (!candidates.length) return null;
+  const dst = candidates[Math.floor(Math.random() * candidates.length)];
+  const srcSi = state.tables[pick.ti].seats.indexOf(pick.id);
+  state.tables[pick.ti].seats[srcSi] = dst.otherId;
+  state.tables[dst.ti].seats[dst.si] = pick.id;
+  return () => {
+    state.tables[pick.ti].seats[srcSi] = pick.id;
+    state.tables[dst.ti].seats[dst.si] = dst.otherId;
+  };
+}
+
 function randomMoveInPlace() {
   const r = Math.random();
-  if (r < 0.25) return moveSwap();
-  if (r < 0.42) return movePlaceUnseated();
-  if (r < 0.45) return moveGrowTable();
-  if (r < 0.55) return moveShrinkTable();
-  if (r < 0.60) return moveDeleteEmptyTable();
-  if (r < 0.64) return moveMergeTables();
-  if (r < 0.78) return moveSplitTable();
+  if (r < 0.20) return moveSwap();
+  if (r < 0.35) return moveFixIsolated();
+  if (r < 0.47) return movePlaceUnseated();
+  if (r < 0.50) return moveGrowTable();
+  if (r < 0.60) return moveShrinkTable();
+  if (r < 0.64) return moveDeleteEmptyTable();
+  if (r < 0.68) return moveMergeTables();
+  if (r < 0.80) return moveSplitTable();
   if (r < 0.94) return moveEjectFromOversized();
   return moveAddTable();
 }
@@ -858,20 +901,40 @@ function greedySeatEveryone() {
   // packed-together bin scores badly), not discover the consolidation from scratch.
   const greedyCap = 6;
   const hardMaxCap = 2 * MAX_LINKED + 2;
+  const clusterGroups = cluster => {
+    const gs = new Set();
+    cluster.forEach(id => { const g = guestById(id); if (g) g.groups.forEach(gid => gs.add(gid)); });
+    return gs;
+  };
   const bins = [];
+  const binGroups = [];
   [...byCluster.values()].sort((a, b) => b.length - a.length).forEach(cluster => {
     if (cluster.length > hardMaxCap) {
-      for (let i = 0; i < cluster.length; i += hardMaxCap) bins.push(cluster.slice(i, i + hardMaxCap));
+      for (let i = 0; i < cluster.length; i += hardMaxCap) {
+        const chunk = cluster.slice(i, i + hardMaxCap);
+        bins.push(chunk);
+        binGroups.push(clusterGroups(chunk));
+      }
       return;
     }
+    const cGroups = clusterGroups(cluster);
     const binCap = Math.max(greedyCap, cluster.length);
-    let target = null, bestRemaining = Infinity;
-    bins.forEach(bin => {
+    let target = null, targetIdx = -1, bestScore = -Infinity;
+    bins.forEach((bin, bi) => {
       const remaining = binCap - bin.length;
-      if (cluster.length <= remaining && remaining < bestRemaining) { target = bin; bestRemaining = remaining; }
+      if (cluster.length > remaining) return;
+      let overlap = 0;
+      cGroups.forEach(g => { if (binGroups[bi].has(g)) overlap++; });
+      const score = overlap * 100 - remaining;
+      if (score > bestScore) { target = bin; targetIdx = bi; bestScore = score; }
     });
-    if (target) target.push(...cluster);
-    else bins.push(cluster.slice());
+    if (target) {
+      target.push(...cluster);
+      cGroups.forEach(g => binGroups[targetIdx].add(g));
+    } else {
+      bins.push(cluster.slice());
+      binGroups.push(cGroups);
+    }
   });
 
   bins.forEach(ids => {
@@ -899,7 +962,7 @@ function hillClimb(iterations) {
     const newPlan = planScore();
     const newScore = searchScore(newPlan);
     const delta = newScore - currentScore;
-    const temperature = 150 * (1 - i / iterations) + 1;
+    const temperature = 60 * (1 - i / iterations) + 0.5;
     if (delta >= 0 || Math.random() < Math.exp(delta / temperature)) {
       currentScore = newScore;
       if (isBetterPlan(newPlan, bestPlan)) { bestPlan = newPlan; bestSnapshot = cloneAllTables(); }
