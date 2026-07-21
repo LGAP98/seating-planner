@@ -1151,8 +1151,8 @@ function tableCapacity(t) { return 2 * t.linked + 2; }
 // stack new tables below whatever's already there so a wide "linked" table never overlaps the next one
 function pushNewTable() {
   const n = state.tables.length;
-  const y = state.tables.length ? Math.max(...state.tables.map(t => t.y + tableFootprint(t.linked).height)) + 50 : 40;
-  state.tables.push({ id: crypto.randomUUID(), name: 'Table ' + (n + 1), linked: 1, seats: [null, null, null, null], x: 40, y });
+  const y = state.tables.length ? Math.max(...state.tables.map(t => t.y + tableFootprint(t.linked).height)) + 60 : 60;
+  state.tables.push({ id: crypto.randomUUID(), name: 'Table ' + (n + 1), linked: 1, seats: [null, null, null, null], x: 60, y });
 }
 function addTable() { pushNewTable(); save(); renderAll(); }
 
@@ -1162,7 +1162,7 @@ function addTable() { pushNewTable(); save(); renderAll(); }
 // the survivors relative to each other).
 function arrangeTables() {
   if (!state.tables.length) return;
-  const margin = 40, gapX = 40, gapY = 70;
+  const margin = 60, gapX = 60, gapY = 90;
   const room = document.getElementById('room');
   const rowWidth = Math.max(700, room.clientWidth - margin * 2);
   let x = margin, y = margin, rowHeight = 0;
@@ -1260,13 +1260,13 @@ function initials(name) {
   return parts.length > 1 ? (parts[0][0] + parts[parts.length - 1][0]).toUpperCase() : name.slice(0, 2).toUpperCase();
 }
 
-function makeGroupsBtn(guest, extraClass) {
+function makeGroupsBtn(guest, extraClass, maxDots = 3) {
   const groupsBtn = document.createElement('span');
   groupsBtn.className = 'group-dots' + (extraClass ? ' ' + extraClass : '');
   groupsBtn.title = 'Edit groups';
   const gs = guest.groups.map(id => groupById(id)).filter(Boolean);
   groupsBtn.innerHTML = gs.length
-    ? gs.slice(0, 3).map(g => `<span class="dot" style="background:${g.color}"></span>`).join('') + (gs.length > 3 ? `<span class="more">+${gs.length - 3}</span>` : '')
+    ? gs.slice(0, maxDots).map(g => `<span class="dot" style="background:${g.color}"></span>`).join('') + (gs.length > maxDots ? `<span class="more">+${gs.length - maxDots}</span>` : '')
     : `<span class="dot-empty">+</span>`;
   groupsBtn.onclick = e => { e.stopPropagation(); openGroupPicker(guest.id, groupsBtn); };
   return groupsBtn;
@@ -1283,7 +1283,7 @@ function makeDeleteBtn(guest, extraClass) {
 
 // avatarMode: seat is too narrow for a full name (physically-narrow end seats, or zoomed way out) —
 // show initials in a circle instead, full name revealed on hover via pure-CSS tooltip
-function chip(guest, avatarMode) {
+function chip(guest, avatarMode, inSeat) {
   if (avatarMode) {
     const el = document.createElement('div');
     el.className = 'avatar-wrap' + (guest.id === selectedGuestId ? ' selected' : '') + (guest.id === pairSelectId ? ' selected-pair' : '');
@@ -1307,11 +1307,12 @@ function chip(guest, avatarMode) {
     tip.textContent = guest.name;
     el.appendChild(tip);
 
-    el.appendChild(makeGroupsBtn(guest, 'avatar-badge'));
+    el.appendChild(makeGroupsBtn(guest, 'avatar-badge', 2));
     el.appendChild(makeDeleteBtn(guest, 'avatar-del'));
     return el;
   }
 
+  const dotMax = inSeat ? 2 : 3;
   const el = document.createElement('div');
   el.className = 'chip' + (guest.id === selectedGuestId ? ' selected' : '') + (guest.id === pairSelectId ? ' selected-pair' : '');
   el.dataset.guestId = guest.id;
@@ -1328,7 +1329,7 @@ function chip(guest, avatarMode) {
   label.className = 'name';
   label.textContent = guest.name;
   el.appendChild(label);
-  el.appendChild(makeGroupsBtn(guest));
+  el.appendChild(makeGroupsBtn(guest, '', dotMax));
   el.appendChild(makeDeleteBtn(guest, 'chip-del'));
 
   return el;
@@ -1500,7 +1501,7 @@ function renderAll() {
       seat.ondragleave = () => seat.classList.remove('dragover');
       seat.ondrop = e => { e.preventDefault(); seat.classList.remove('dragover'); placeGuest(e.dataTransfer.getData('text/plain'), t.id, i); };
       seat.onclick = () => trySeatSelected(t.id, i);
-      if (guestId) { const g = guestById(guestId); if (g) seat.appendChild(chip(g, r.width < SEAT_LEGIBLE_PX)); }
+      if (guestId) { const g = guestById(guestId); if (g) seat.appendChild(chip(g, r.width < SEAT_LEGIBLE_PX, true)); }
       wrapper.appendChild(seat);
     });
 

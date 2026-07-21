@@ -98,7 +98,7 @@ ul.plain li:last-child { border-bottom: none; }
   background-image: radial-gradient(var(--border) 1px, transparent 1px);
   background-size: 22px 22px;
   overflow: auto; min-height: 420px;
-  cursor: grab;
+  cursor: grab; padding: 30px 0 0 0;
 }
 .room.panning { cursor: grabbing; }
 
@@ -106,13 +106,14 @@ ul.plain li:last-child { border-bottom: none; }
 .table-surface { position: absolute; background: var(--panel); border: 2px solid var(--accent); border-radius: 6px; box-shadow: var(--shadow); cursor: grab; }
 .table-surface:active { cursor: grabbing; }
 .table-handle {
-  position: absolute; left: 50%; transform: translateX(-50%); top: -26px; white-space: nowrap; font-size: 11px; font-weight: 700;
+  position: absolute; left: 0; right: 0; top: -26px; white-space: nowrap; font-size: 11px; font-weight: 700;
   color: var(--text); display: flex; align-items: center; justify-content: center; gap: 5px; cursor: grab;
   background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px; box-shadow: var(--shadow); z-index: 2;
+  width: fit-content; max-width: 100%; margin: 0 auto; overflow: hidden;
 }
 .table-handle:active { cursor: grabbing; }
 .table-handle .grip { color: var(--muted); letter-spacing: -1px; padding: 0 1px; }
-.table-handle input.name-input { border: none; background: transparent; font-weight: 700; font-size: 11px; width: 74px; color: var(--text); padding: 1px; }
+.table-handle input.name-input { border: none; background: transparent; font-weight: 700; font-size: 11px; width: 5.5em; min-width: 3em; max-width: 10em; color: var(--text); padding: 1px; }
 .table-handle .cap { font-weight: 400; color: var(--muted); display: flex; align-items: center; gap: 3px; }
 .table-handle .linked-input { width: 26px; text-align: center; padding: 2px 3px; }
 .table-handle button.icon { padding: 0 2px; }
@@ -124,9 +125,10 @@ ul.plain li:last-child { border-bottom: none; }
 .seat:empty::after { content: "·"; opacity: .25; }
 .seat .chip { margin: 0; padding: 2px 5px; font-size: 10.5px; cursor: grab; box-shadow: none; max-width: 100%; min-width: 0; }
 .seat .chip span.name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 1; }
-.seat .chip .group-dots { padding: 1px 2px; gap: 1px; }
+.seat .chip .group-dots { padding: 1px 2px; gap: 1px; max-width: 32px; overflow: hidden; }
 .seat .chip .group-dots .dot, .seat .chip .group-dots .dot-empty { width: 6px; height: 6px; }
 .seat .chip .group-dots .dot-empty { font-size: 0; line-height: 0; }
+.seat .chip .group-dots .more { font-size: 8px; }
 
 .avatar-wrap { position: relative; display: inline-flex; cursor: grab; user-select: none; }
 .avatar-wrap:active { cursor: grabbing; }
