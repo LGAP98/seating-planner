@@ -436,23 +436,31 @@ function showRelPicker(guestA, guestB, anchorX, anchorY) {
 
 // -- relationship hover highlighting --
 function highlightRelated(guestId) {
+  const guest = guestById(guestId);
   const related = new Map();
   state.rels.forEach(r => {
     if (r.a === guestId) related.set(r.b, r.type);
     else if (r.b === guestId) related.set(r.a, r.type);
   });
-  if (!related.size) return;
+  const sameGroup = new Set();
+  if (guest && guest.groups.length) {
+    state.guests.forEach(g => {
+      if (g.id !== guestId && g.groups.some(grp => guest.groups.includes(grp))) sameGroup.add(g.id);
+    });
+  }
+  if (!related.size && !sameGroup.size) return;
   document.querySelectorAll('[data-guest-id]').forEach(el => {
     const id = el.dataset.guestId;
     if (id === guestId) return;
     const type = related.get(id);
     if (type) el.classList.add('rel-highlight', 'rel-' + type);
+    else if (sameGroup.has(id)) el.classList.add('rel-highlight', 'rel-group');
     else el.classList.add('rel-dimmed');
   });
 }
 function clearHighlights() {
   document.querySelectorAll('.rel-highlight,.rel-dimmed').forEach(el => {
-    el.classList.remove('rel-highlight', 'rel-must', 'rel-conflict', 'rel-knows', 'rel-dimmed');
+    el.classList.remove('rel-highlight', 'rel-must', 'rel-conflict', 'rel-knows', 'rel-group', 'rel-dimmed');
   });
 }
 
@@ -1147,7 +1155,7 @@ function importJson(ev) {
 
 // ===== Tables & seating =====
 
-function tableCapacity(t) { return 2 * t.linked + 2; }
+function tableCapacity(t) { return t.headTable ? 2 * t.linked : 2 * t.linked + 2; }
 // stack new tables below whatever's already there so a wide "linked" table never overlaps the next one
 function pushNewTable() {
   const n = state.tables.length;
@@ -1199,7 +1207,7 @@ function deleteTable(id) {
 function setTableLinked(id, linked) {
   const t = state.tables.find(t => t.id === id);
   linked = Math.max(1, parseInt(linked) || 1);
-  const newCap = 2 * linked + 2;
+  const newCap = t.headTable ? 2 * linked : 2 * linked + 2;
   const seatedGuests = t.seats.filter(Boolean);
   const overflow = seatedGuests.length - newCap;
   // shrinking below the seated count used to leave the extra guests in the array at seat
@@ -1217,6 +1225,20 @@ function setTableLinked(id, linked) {
 function setTableName(id, name) {
   state.tables.find(t => t.id === id).name = name;
   save();
+}
+function toggleHeadTable(id) {
+  const t = state.tables.find(t => t.id === id);
+  const wasHead = !!t.headTable;
+  t.headTable = !wasHead;
+  const newCap = tableCapacity(t);
+  const seated = t.seats.filter(Boolean);
+  if (wasHead) {
+    t.seats = seated.slice(0, newCap).concat(Array(Math.max(0, newCap - seated.length)).fill(null));
+  } else {
+    const keep = seated.slice(0, newCap);
+    t.seats = keep.concat(Array(Math.max(0, newCap - keep.length)).fill(null));
+  }
+  save(); renderAll();
 }
 
 function removeGuestFromAllSeats(guestId) {
@@ -1245,8 +1267,13 @@ function dropOnPool(ev) {
 // (interactive, via roomZoom) — same geometry math either way.
 const SQ = 82, PAD = 46, SEAT_W = 68, SEAT_H = 34, SEAT_W2 = 34, SEAT_H2 = 60;
 function tableFootprint(n, scale = 1) { return { width: n * SQ * scale + PAD * scale * 2, height: SQ * scale + PAD * scale * 2 }; }
-function seatRect(n, idx, scale = 1) {
+function seatRect(n, idx, scale = 1, headTable = false) {
   const sq = SQ * scale, pad = PAD * scale, sw = SEAT_W * scale, sh = SEAT_H * scale, sw2 = SEAT_W2 * scale, sh2 = SEAT_H2 * scale, gap = 6 * scale;
+  if (headTable) {
+    if (idx < n) return { left: pad + idx * sq + (sq - sw) / 2, top: pad - sh - gap, width: sw, height: sh };
+    const i = idx - n;
+    return { left: pad + i * sq + (sq - sw) / 2, top: pad + sq + gap, width: sw, height: sh };
+  }
   if (idx < n) return { left: pad + idx * sq + (sq - sw) / 2, top: pad - sh - gap, width: sw, height: sh };
   if (idx < 2 * n) { const i = idx - n; return { left: pad + i * sq + (sq - sw) / 2, top: pad + sq + gap, width: sw, height: sh }; }
   if (idx === 2 * n) return { left: pad - sw2 - gap, top: pad + (sq - sh2) / 2, width: sw2, height: sh2 };
@@ -1476,7 +1503,9 @@ function renderAll() {
     const handle = document.createElement('div');
     handle.className = 'table-handle';
     const cap = tableCapacity(t);
+    const headActive = t.headTable ? ' active' : '';
     handle.innerHTML = `<span class="grip" title="drag to move">⠿</span>
+      <button class="head-toggle${headActive}" onclick="toggleHeadTable('${t.id}')" title="${t.headTable ? 'Switch to standard table (with side seats)' : 'Switch to head table (no side seats)'}">⊟</button>
       <input class="name-input" value="${t.name}" onchange="setTableName('${t.id}',this.value)">
       <span class="cap">🔗<input type="number" class="linked-input" min="1" value="${t.linked}" onchange="setTableLinked('${t.id}',this.value)">= ${cap} seats</span>
       <button class="icon" title="Remove table">✕</button>`;
@@ -1492,7 +1521,7 @@ function renderAll() {
     wrapper.appendChild(surface);
 
     t.seats.forEach((guestId, i) => {
-      const r = seatRect(n, i, roomZoom);
+      const r = seatRect(n, i, roomZoom, !!t.headTable);
       const seat = document.createElement('div');
       seat.className = 'seat';
       seat.style.left = r.left + 'px'; seat.style.top = r.top + 'px';
@@ -1581,7 +1610,7 @@ function exportPng() {
     fillEllipsizedText(ctx, `${t.name} · ${tableCapacity(t)} seats`, ox + fp.width / 2, oy - 10, fp.width);
 
     t.seats.forEach((guestId, i) => {
-      const r = seatRect(n, i, LAYOUT_SCALE);
+      const r = seatRect(n, i, LAYOUT_SCALE, !!t.headTable);
       roundRectPath(ctx, ox + r.left, oy + r.top, r.width, r.height, 8);
       ctx.fillStyle = bg; ctx.fill();
       ctx.setLineDash([4, 3]); ctx.lineWidth = 1.5; ctx.strokeStyle = border; ctx.stroke(); ctx.setLineDash([]);
