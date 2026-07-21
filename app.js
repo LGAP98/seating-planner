@@ -520,8 +520,8 @@ function tableScoreDetail(table, knowsPairs) {
 }
 
 // returns null finalScore when nobody's seated yet — there's nothing meaningful to grade.
-function planScore() {
-  const knowsPairs = buildKnowsIndex();
+function planScore(cachedKnowsPairs) {
+  const knowsPairs = cachedKnowsPairs || buildKnowsIndex();
   const details = state.tables
     .map(t => ({ table: t, detail: tableScoreDetail(t, knowsPairs) }))
     .filter(d => d.detail);
@@ -556,19 +556,29 @@ function planScore() {
 // tells it not to (a set of near-empty tables can score just as "perfect" as two tidy ones).
 function searchScore(s) {
   let tableSizePressure = 0;
-  const mustIds = new Set();
-  state.rels.filter(r => r.type === 'must').forEach(r => { mustIds.add(r.a); mustIds.add(r.b); });
+  const mustClusterMin = mustClusterMinSize();
   state.tables.forEach(t => {
-    const seated = t.seats.filter(Boolean);
-    const k = seated.length;
+    const k = t.seats.filter(Boolean).length;
     if (k === 0) return;
-    const hasMust = seated.some(id => mustIds.has(id));
-    if (hasMust) return;
     if (k <= 6) tableSizePressure += 4;
     else if (k <= 8) tableSizePressure += 1;
+    else if (k <= mustClusterMin) tableSizePressure -= 2;
     else tableSizePressure -= (k - 6) * (k - 6);
   });
   return (s.finalScore ?? -1) + 3 * s.seatedCount - 0.5 * s.emptySeats - 0.5 * s.tableCount + tableSizePressure;
+}
+
+function mustClusterMinSize() {
+  const mustPairs = state.rels.filter(r => r.type === 'must');
+  if (!mustPairs.length) return 0;
+  const ids = new Set();
+  mustPairs.forEach(r => { ids.add(r.a); ids.add(r.b); });
+  const parent = new Map([...ids].map(id => [id, id]));
+  function find(x) { while (parent.get(x) !== x) { parent.set(x, parent.get(parent.get(x))); x = parent.get(x); } return x; }
+  mustPairs.forEach(r => { const ra = find(r.a), rb = find(r.b); if (ra !== rb) parent.set(ra, rb); });
+  const sizes = new Map();
+  ids.forEach(id => { const r = find(id); sizes.set(r, (sizes.get(r) || 0) + 1); });
+  return Math.max(...sizes.values());
 }
 
 // Violation count is compared FIRST, strictly — not just folded into the point score. A flat point
@@ -668,7 +678,7 @@ function movePlaceUnseated() {
 function moveGrowTable() {
   if (!state.tables.length) return null;
   const t = state.tables[Math.floor(Math.random() * state.tables.length)];
-  if (t.linked >= MAX_LINKED) return null;
+  if (t.linked >= MAX_LINKED || tableCapacity(t) >= 8) return null;
   const oldLinked = t.linked, oldSeats = t.seats.slice();
   t.linked += 1;
   t.seats = oldSeats.concat([null, null]); // +1 linked table = +2 seats (one more on each long side)
@@ -721,6 +731,7 @@ function moveMergeTables() {
   const newLinked = tableA.linked + tableB.linked;
   if (newLinked > MAX_LINKED) return null;
   const newCap = 2 * newLinked + 2;
+  if (newCap > 8) return null;
   const combinedSeated = tableA.seats.filter(Boolean).concat(tableB.seats.filter(Boolean));
   if (combinedSeated.length > newCap) return null; // would lose more seats than are spare — not allowed
 
@@ -802,15 +813,120 @@ function moveEjectFromOversized() {
   return () => { state.tables[dstTi].seats[dstSi] = null; t.seats[srcSi] = guestId; };
 }
 
-function randomMoveInPlace() {
+function moveFixIsolated(cachedKnowsPairs) {
+  const knowsPairs = cachedKnowsPairs || buildKnowsIndex();
+  const isolated = [];
+  state.tables.forEach((t, ti) => {
+    const seated = t.seats.filter(Boolean);
+    seated.forEach(id => {
+      const knows = seated.some(other => other !== id && knowEachOther(id, other, knowsPairs));
+      if (!knows) isolated.push({ id, ti });
+    });
+  });
+  if (!isolated.length) return null;
+  const pick = isolated[Math.floor(Math.random() * isolated.length)];
+  const guest = guestById(pick.id);
+  if (!guest) return null;
+  const guestGroups = new Set(guest.groups);
+  const candidates = [];
+  state.tables.forEach((t, ti) => {
+    if (ti === pick.ti) return;
+    const seated = t.seats.filter(Boolean);
+    const hasGroupmate = seated.some(otherId => {
+      const other = guestById(otherId);
+      return other && other.groups.some(g => guestGroups.has(g));
+    });
+    if (!hasGroupmate) return;
+    seated.forEach((otherId, si) => {
+      if (!otherId) return;
+      const otherGuest = guestById(otherId);
+      const otherHasLocalFriends = seated.some(x => x && x !== otherId && knowEachOther(otherId, x, knowsPairs));
+      if (otherHasLocalFriends) candidates.push({ ti, si, otherId });
+    });
+  });
+  if (!candidates.length) return null;
+  const dst = candidates[Math.floor(Math.random() * candidates.length)];
+  const srcSi = state.tables[pick.ti].seats.indexOf(pick.id);
+  state.tables[pick.ti].seats[srcSi] = dst.otherId;
+  state.tables[dst.ti].seats[dst.si] = pick.id;
+  return () => {
+    state.tables[pick.ti].seats[srcSi] = pick.id;
+    state.tables[dst.ti].seats[dst.si] = dst.otherId;
+  };
+}
+
+function moveRelocateIsolated(cachedKnowsPairs) {
+  const knowsPairs = cachedKnowsPairs || buildKnowsIndex();
+  const isolated = [];
+  state.tables.forEach((t, ti) => {
+    const seated = t.seats.filter(Boolean);
+    seated.forEach(id => {
+      if (!seated.some(other => other !== id && knowEachOther(id, other, knowsPairs))) {
+        isolated.push({ id, ti });
+      }
+    });
+  });
+  if (!isolated.length) return null;
+  const pick = isolated[Math.floor(Math.random() * isolated.length)];
+  const guest = guestById(pick.id);
+  if (!guest) return null;
+  const guestGroups = new Set(guest.groups);
+  const emptySlots = [];
+  state.tables.forEach((t, ti) => {
+    if (ti === pick.ti) return;
+    const seated = t.seats.filter(Boolean);
+    const hasGroupmate = seated.some(otherId => {
+      const other = guestById(otherId);
+      return other && other.groups.some(g => guestGroups.has(g));
+    });
+    if (!hasGroupmate) return;
+    t.seats.forEach((v, si) => { if (!v) emptySlots.push({ ti, si }); });
+  });
+  if (!emptySlots.length) return null;
+  const dst = emptySlots[Math.floor(Math.random() * emptySlots.length)];
+  const srcSi = state.tables[pick.ti].seats.indexOf(pick.id);
+  state.tables[pick.ti].seats[srcSi] = null;
+  state.tables[dst.ti].seats[dst.si] = pick.id;
+  return () => {
+    state.tables[dst.ti].seats[dst.si] = null;
+    state.tables[pick.ti].seats[srcSi] = pick.id;
+  };
+}
+
+function moveCycleSwap() {
+  const occupied = [];
+  state.tables.forEach((t, ti) => {
+    t.seats.forEach((id, si) => { if (id) occupied.push({ ti, si, id }); });
+  });
+  if (occupied.length < 3) return null;
+  const i0 = Math.floor(Math.random() * occupied.length);
+  let i1 = Math.floor(Math.random() * occupied.length);
+  if (i1 === i0) return null;
+  let i2 = Math.floor(Math.random() * occupied.length);
+  if (i2 === i0 || i2 === i1) return null;
+  const a = occupied[i0], b = occupied[i1], c = occupied[i2];
+  state.tables[a.ti].seats[a.si] = c.id;
+  state.tables[b.ti].seats[b.si] = a.id;
+  state.tables[c.ti].seats[c.si] = b.id;
+  return () => {
+    state.tables[a.ti].seats[a.si] = a.id;
+    state.tables[b.ti].seats[b.si] = b.id;
+    state.tables[c.ti].seats[c.si] = c.id;
+  };
+}
+
+function randomMoveInPlace(knowsPairs) {
   const r = Math.random();
-  if (r < 0.25) return moveSwap();
-  if (r < 0.42) return movePlaceUnseated();
-  if (r < 0.45) return moveGrowTable();
-  if (r < 0.55) return moveShrinkTable();
-  if (r < 0.60) return moveDeleteEmptyTable();
-  if (r < 0.64) return moveMergeTables();
-  if (r < 0.78) return moveSplitTable();
+  if (r < 0.15) return moveSwap();
+  if (r < 0.27) return moveFixIsolated(knowsPairs);
+  if (r < 0.39) return moveRelocateIsolated(knowsPairs);
+  if (r < 0.49) return moveCycleSwap();
+  if (r < 0.56) return movePlaceUnseated();
+  if (r < 0.59) return moveGrowTable();
+  if (r < 0.66) return moveShrinkTable();
+  if (r < 0.69) return moveDeleteEmptyTable();
+  if (r < 0.72) return moveMergeTables();
+  if (r < 0.82) return moveSplitTable();
   if (r < 0.94) return moveEjectFromOversized();
   return moveAddTable();
 }
@@ -847,20 +963,40 @@ function greedySeatEveryone() {
   // packed-together bin scores badly), not discover the consolidation from scratch.
   const greedyCap = 6;
   const hardMaxCap = 2 * MAX_LINKED + 2;
+  const clusterGroups = cluster => {
+    const gs = new Set();
+    cluster.forEach(id => { const g = guestById(id); if (g) g.groups.forEach(gid => gs.add(gid)); });
+    return gs;
+  };
   const bins = [];
+  const binGroups = [];
   [...byCluster.values()].sort((a, b) => b.length - a.length).forEach(cluster => {
     if (cluster.length > hardMaxCap) {
-      for (let i = 0; i < cluster.length; i += hardMaxCap) bins.push(cluster.slice(i, i + hardMaxCap));
+      for (let i = 0; i < cluster.length; i += hardMaxCap) {
+        const chunk = cluster.slice(i, i + hardMaxCap);
+        bins.push(chunk);
+        binGroups.push(clusterGroups(chunk));
+      }
       return;
     }
+    const cGroups = clusterGroups(cluster);
     const binCap = Math.max(greedyCap, cluster.length);
-    let target = null, bestRemaining = Infinity;
-    bins.forEach(bin => {
+    let target = null, targetIdx = -1, bestScore = -Infinity;
+    bins.forEach((bin, bi) => {
       const remaining = binCap - bin.length;
-      if (cluster.length <= remaining && remaining < bestRemaining) { target = bin; bestRemaining = remaining; }
+      if (cluster.length > remaining) return;
+      let overlap = 0;
+      cGroups.forEach(g => { if (binGroups[bi].has(g)) overlap++; });
+      const score = overlap * 100 - remaining;
+      if (score > bestScore) { target = bin; targetIdx = bi; bestScore = score; }
     });
-    if (target) target.push(...cluster);
-    else bins.push(cluster.slice());
+    if (target) {
+      target.push(...cluster);
+      cGroups.forEach(g => binGroups[targetIdx].add(g));
+    } else {
+      bins.push(cluster.slice());
+      binGroups.push(cGroups);
+    }
   });
 
   bins.forEach(ids => {
@@ -878,17 +1014,19 @@ function greedySeatEveryone() {
 // so early on (temperature high) we sometimes accept a worse move to escape it, cooling toward
 // pure-greedy by the end. The best state seen at any point is tracked separately and restored
 // at the end, since the annealed "current" state can wander below it.
-function hillClimb(iterations) {
-  let currentScore = searchScore(planScore());
-  let bestPlan = planScore(); // full object, so "best" is judged by isBetterPlan (violations dominate), not the raw scalar used for SA acceptance
+async function hillClimb(iterations) {
+  const knowsPairs = buildKnowsIndex();
+  let currentScore = searchScore(planScore(knowsPairs));
+  let bestPlan = planScore(knowsPairs);
   let bestSnapshot = cloneAllTables();
   for (let i = 0; i < iterations; i++) {
-    const undo = randomMoveInPlace();
+    if (i % 400 === 0 && i > 0) await new Promise(r => setTimeout(r, 0));
+    const undo = randomMoveInPlace(knowsPairs);
     if (!undo) continue;
-    const newPlan = planScore();
+    const newPlan = planScore(knowsPairs);
     const newScore = searchScore(newPlan);
     const delta = newScore - currentScore;
-    const temperature = 150 * (1 - i / iterations) + 1;
+    const temperature = 60 * (1 - i / iterations) + 0.5;
     if (delta >= 0 || Math.random() < Math.exp(delta / temperature)) {
       currentScore = newScore;
       if (isBetterPlan(newPlan, bestPlan)) { bestPlan = newPlan; bestSnapshot = cloneAllTables(); }
@@ -899,13 +1037,11 @@ function hillClimb(iterations) {
   restoreAllTables(bestSnapshot);
 }
 
-function runSeatingOptimizer() {
-  const trueOriginalSnapshot = cloneAllTables(); // what the user actually has, before any of this
+async function runSeatingOptimizer(milpSnapshot) {
+  const trueOriginalSnapshot = cloneAllTables();
   const trueOriginalScore = planScore();
   if (!state.guests.length) { alert('Add some guests first — there\'s nothing to seat yet.'); return; }
 
-  // guarantee everyone has a seat before optimizing at all — completeness is never left up to
-  // whether the random search happens to get there.
   greedySeatEveryone();
   const workingBaseline = cloneAllTables();
 
@@ -945,11 +1081,105 @@ function runSeatingOptimizer() {
   }
   const smallSeed = makeSmallTableSeed();
 
-  const RESTARTS = 12, ITERATIONS = 8000;
+  function makeRoundRobinSeed() {
+    const mustPairs = state.rels.filter(r => r.type === 'must');
+    const allIds = state.guests.map(g => g.id);
+    const parent = new Map(allIds.map(id => [id, id]));
+    function find(x) { while (parent.get(x) !== x) { parent.set(x, parent.get(parent.get(x))); x = parent.get(x); } return x; }
+    mustPairs.forEach(r => { const ra = find(r.a), rb = find(r.b); if (ra !== rb) parent.set(ra, rb); });
+    const byCluster = new Map();
+    allIds.forEach(id => { const k = find(id); if (!byCluster.has(k)) byCluster.set(k, []); byCluster.get(k).push(id); });
+    const clusters = [...byCluster.values()].sort((a, b) => b.length - a.length);
+
+    const tableCap = 6;
+    const numTables = Math.max(1, Math.ceil(allIds.length / tableCap));
+    const bins = Array.from({ length: numTables }, () => []);
+
+    const bigClusters = clusters.filter(c => c.length > 1);
+    const singletons = clusters.filter(c => c.length === 1).map(c => c[0]);
+
+    bigClusters.forEach(cluster => {
+      let best = 0, bestCount = Infinity;
+      bins.forEach((b, i) => { if (b.length < bestCount) { bestCount = b.length; best = i; } });
+      if (bins[best].length + cluster.length <= tableCap) {
+        bins[best].push(...cluster);
+      } else {
+        cluster.forEach((id, ci) => {
+          const ti = (best + ci) % numTables;
+          bins[ti].push(id);
+        });
+      }
+    });
+
+    const groupMembers = new Map();
+    singletons.forEach(id => {
+      const g = guestById(id);
+      if (g) g.groups.forEach(gid => {
+        if (!groupMembers.has(gid)) groupMembers.set(gid, []);
+        groupMembers.get(gid).push(id);
+      });
+    });
+    const groups = [...groupMembers.entries()].sort((a, b) => b[1].length - a[1].length);
+    const placed = new Set(bigClusters.flat());
+
+    groups.forEach(([, members]) => {
+      const unplaced = members.filter(id => !placed.has(id));
+      for (let i = unplaced.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [unplaced[i], unplaced[j]] = [unplaced[j], unplaced[i]];
+      }
+      let ti = Math.floor(Math.random() * numTables);
+      unplaced.forEach(id => {
+        let attempts = numTables;
+        while (bins[ti].length >= tableCap && attempts-- > 0) ti = (ti + 1) % numTables;
+        bins[ti].push(id);
+        placed.add(id);
+        ti = (ti + 1) % numTables;
+      });
+    });
+
+    singletons.filter(id => !placed.has(id)).forEach(id => {
+      let best = 0, bestCount = Infinity;
+      bins.forEach((b, i) => { if (b.length < bestCount) { bestCount = b.length; best = i; } });
+      bins[best].push(id);
+    });
+
+    const tables = bins.filter(b => b.length > 0).map(b => {
+      const linked = Math.max(1, Math.ceil((b.length - 2) / 2));
+      const cap = 2 * linked + 2;
+      return {
+        id: crypto.randomUUID(), name: 'T', linked,
+        seats: b.slice(0, cap).concat(Array(Math.max(0, cap - b.length)).fill(null)),
+        x: 60, y: 60,
+      };
+    });
+    state.tables.length = 0;
+    tables.forEach(t => state.tables.push(t));
+    return cloneAllTables();
+  }
+  const roundRobinSeed = makeRoundRobinSeed();
+
+  let milpSeed = null;
+  if (milpSnapshot) {
+    restoreAllTables(milpSnapshot.map(t => ({ ...t, seats: [...t.seats] })));
+    milpSeed = cloneAllTables();
+  }
+
+  const RESTARTS = 10, ITERATIONS = 5000;
   let bestSnapshot = workingBaseline, bestScore = planScore();
+
+  if (milpSeed) {
+    restoreAllTables(milpSeed);
+    const milpScore = planScore();
+    if (isBetterPlan(milpScore, bestScore)) { bestScore = milpScore; bestSnapshot = cloneAllTables(); }
+  }
+
   for (let r = 0; r < RESTARTS; r++) {
-    restoreAllTables(r < 2 ? workingBaseline : smallSeed);
-    hillClimb(ITERATIONS);
+    if (milpSeed && r < 2) restoreAllTables(milpSeed);
+    else if (r < 3) restoreAllTables(workingBaseline);
+    else if (r < 7) restoreAllTables(roundRobinSeed);
+    else restoreAllTables(smallSeed);
+    await hillClimb(ITERATIONS);
     const candidateScore = planScore();
     if (isBetterPlan(candidateScore, bestScore)) { bestScore = candidateScore; bestSnapshot = cloneAllTables(); }
   }
@@ -1133,39 +1363,24 @@ async function suggestBetterPlan() {
   const btn = document.getElementById('optimizeBtn');
   btn.disabled = true;
   try {
-    let milpHandled = false;
+    let milpSnapshot = null;
     try {
       btn.textContent = 'Loading solver…';
       const milpTables = await runMILP();
       btn.textContent = 'Evaluating…';
       const snap = cloneAllTables();
-      const oldScore = planScore();
       state.tables.length = 0;
       milpTables.forEach(t => state.tables.push(t));
-      const newScore = planScore();
+      const milpScore = planScore();
       restoreAllTables(snap);
-      if (isBetterPlan(newScore, oldScore)) {
-        const from = oldScore.finalScore === null ? 'no plan yet' : oldScore.finalScore;
-        const extras = [];
-        if (milpTables.length !== snap.length) extras.push(`${milpTables.length} table${milpTables.length !== 1 ? 's' : ''} instead of ${snap.length}`);
-        if (newScore.mustViolations + newScore.conflictViolations < oldScore.mustViolations + oldScore.conflictViolations) extras.push('resolves constraint violations');
-        const msg = `MILP optimizer found a better arrangement: ${from} → ${newScore.finalScore}/100`
-          + (extras.length ? ` (${extras.join(', ')})` : '')
-          + `.\n\nApply? (You can Undo afterward.)`;
-        if (confirm(msg)) {
-          state.tables.length = 0;
-          milpTables.forEach(t => state.tables.push(t));
-          save(); renderAll();
-        }
-        milpHandled = true;
+      if (milpScore.finalScore !== null) {
+        milpSnapshot = milpTables;
       }
     } catch (e) { console.warn('MILP:', e.message); }
 
-    if (!milpHandled) {
-      btn.textContent = 'Optimizing…';
-      await new Promise(r => setTimeout(r, 20));
-      runSeatingOptimizer();
-    }
+    btn.textContent = 'Optimizing…';
+    await new Promise(r => setTimeout(r, 20));
+    await runSeatingOptimizer(milpSnapshot);
   } finally {
     btn.disabled = false;
     btn.textContent = '✨ Suggest better plan';
