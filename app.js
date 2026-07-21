@@ -973,13 +973,11 @@ function hillClimb(iterations) {
   restoreAllTables(bestSnapshot);
 }
 
-function runSeatingOptimizer() {
-  const trueOriginalSnapshot = cloneAllTables(); // what the user actually has, before any of this
+function runSeatingOptimizer(milpSnapshot) {
+  const trueOriginalSnapshot = cloneAllTables();
   const trueOriginalScore = planScore();
   if (!state.guests.length) { alert('Add some guests first — there\'s nothing to seat yet.'); return; }
 
-  // guarantee everyone has a seat before optimizing at all — completeness is never left up to
-  // whether the random search happens to get there.
   greedySeatEveryone();
   const workingBaseline = cloneAllTables();
 
@@ -1019,10 +1017,25 @@ function runSeatingOptimizer() {
   }
   const smallSeed = makeSmallTableSeed();
 
+  let milpSeed = null;
+  if (milpSnapshot) {
+    restoreAllTables(milpSnapshot.map(t => ({ ...t, seats: [...t.seats] })));
+    milpSeed = cloneAllTables();
+  }
+
   const RESTARTS = 12, ITERATIONS = 8000;
   let bestSnapshot = workingBaseline, bestScore = planScore();
+
+  if (milpSeed) {
+    restoreAllTables(milpSeed);
+    const milpScore = planScore();
+    if (isBetterPlan(milpScore, bestScore)) { bestScore = milpScore; bestSnapshot = cloneAllTables(); }
+  }
+
   for (let r = 0; r < RESTARTS; r++) {
-    restoreAllTables(r < 2 ? workingBaseline : smallSeed);
+    if (milpSeed && r < 3) restoreAllTables(milpSeed);
+    else if (r < 5) restoreAllTables(workingBaseline);
+    else restoreAllTables(smallSeed);
     hillClimb(ITERATIONS);
     const candidateScore = planScore();
     if (isBetterPlan(candidateScore, bestScore)) { bestScore = candidateScore; bestSnapshot = cloneAllTables(); }
@@ -1207,39 +1220,24 @@ async function suggestBetterPlan() {
   const btn = document.getElementById('optimizeBtn');
   btn.disabled = true;
   try {
-    let milpHandled = false;
+    let milpSnapshot = null;
     try {
       btn.textContent = 'Loading solver…';
       const milpTables = await runMILP();
       btn.textContent = 'Evaluating…';
       const snap = cloneAllTables();
-      const oldScore = planScore();
       state.tables.length = 0;
       milpTables.forEach(t => state.tables.push(t));
-      const newScore = planScore();
+      const milpScore = planScore();
       restoreAllTables(snap);
-      if (isBetterPlan(newScore, oldScore)) {
-        const from = oldScore.finalScore === null ? 'no plan yet' : oldScore.finalScore;
-        const extras = [];
-        if (milpTables.length !== snap.length) extras.push(`${milpTables.length} table${milpTables.length !== 1 ? 's' : ''} instead of ${snap.length}`);
-        if (newScore.mustViolations + newScore.conflictViolations < oldScore.mustViolations + oldScore.conflictViolations) extras.push('resolves constraint violations');
-        const msg = `MILP optimizer found a better arrangement: ${from} → ${newScore.finalScore}/100`
-          + (extras.length ? ` (${extras.join(', ')})` : '')
-          + `.\n\nApply? (You can Undo afterward.)`;
-        if (confirm(msg)) {
-          state.tables.length = 0;
-          milpTables.forEach(t => state.tables.push(t));
-          save(); renderAll();
-        }
-        milpHandled = true;
+      if (milpScore.finalScore !== null) {
+        milpSnapshot = milpTables;
       }
     } catch (e) { console.warn('MILP:', e.message); }
 
-    if (!milpHandled) {
-      btn.textContent = 'Optimizing…';
-      await new Promise(r => setTimeout(r, 20));
-      runSeatingOptimizer();
-    }
+    btn.textContent = 'Optimizing…';
+    await new Promise(r => setTimeout(r, 20));
+    runSeatingOptimizer(milpSnapshot);
   } finally {
     btn.disabled = false;
     btn.textContent = '✨ Suggest better plan';
