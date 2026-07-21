@@ -232,7 +232,8 @@ function tableScoreDetail(table, knowsPairs) {
   const density = totalPairs ? connectedPairs / totalPairs : 0;
   const isolatedIds = seated.filter(id => connections.get(id) === 0);
   const isolationFree = (k - isolatedIds.length) / k;
-  return { k, isolatedIds, score: 0.6 * isolationFree + 0.4 * density };
+  const socialScore = 0.6 * isolationFree + 0.4 * density;
+  return { k, isolatedIds, score: socialScore };
 }
 
 // returns null finalScore when nobody's seated yet — there's nothing meaningful to grade.
@@ -270,7 +271,22 @@ function planScore() {
 // deliberate breathing room shouldn't see their score drop for it. But the OPTIMIZER needs this
 // pressure, or it happily scatters guests across a dozen sparse tables since nothing in finalScore
 // tells it not to (a set of near-empty tables can score just as "perfect" as two tidy ones).
-function searchScore(s) { return (s.finalScore ?? -1) + 3 * s.seatedCount - 0.5 * s.emptySeats - 3 * s.tableCount; }
+function searchScore(s) {
+  let tableSizePressure = 0;
+  const mustIds = new Set();
+  state.rels.filter(r => r.type === 'must').forEach(r => { mustIds.add(r.a); mustIds.add(r.b); });
+  state.tables.forEach(t => {
+    const seated = t.seats.filter(Boolean);
+    const k = seated.length;
+    if (k === 0) return;
+    const hasMust = seated.some(id => mustIds.has(id));
+    if (hasMust) return;
+    if (k <= 6) tableSizePressure += 4;
+    else if (k <= 8) tableSizePressure += 1;
+    else tableSizePressure -= (k - 6) * (k - 6);
+  });
+  return (s.finalScore ?? -1) + 3 * s.seatedCount - 0.5 * s.emptySeats - 0.5 * s.tableCount + tableSizePressure;
+}
 
 // Violation count is compared FIRST, strictly — not just folded into the point score. A flat point
 // penalty alone can't guarantee "hard constraints dominate" (a small/tightly-packed table can make
@@ -379,7 +395,11 @@ function moveGrowTable() {
 function moveShrinkTable() {
   const candidates = state.tables.filter(t => t.linked > 1);
   if (!candidates.length) return null;
-  const t = candidates[Math.floor(Math.random() * candidates.length)];
+  const weights = candidates.map(t => t.linked);
+  const totalW = weights.reduce((a, b) => a + b, 0);
+  let pick = Math.random() * totalW;
+  let t = candidates[candidates.length - 1];
+  for (let i = 0; i < candidates.length; i++) { pick -= weights[i]; if (pick <= 0) { t = candidates[i]; break; } }
   const newCap = 2 * (t.linked - 1) + 2;
   const seated = t.seats.filter(Boolean);
   if (seated.length > newCap) return null; // would evict a seated guest — not allowed
@@ -441,7 +461,11 @@ function moveMergeTables() {
 function moveSplitTable() {
   const candidates = state.tables.filter(t => t.linked >= 2);
   if (!candidates.length) return null;
-  const t = candidates[Math.floor(Math.random() * candidates.length)];
+  const weights = candidates.map(t => t.linked * t.linked);
+  const totalW = weights.reduce((a, b) => a + b, 0);
+  let pick = Math.random() * totalW;
+  let t = candidates[candidates.length - 1];
+  for (let i = 0; i < candidates.length; i++) { pick -= weights[i]; if (pick <= 0) { t = candidates[i]; break; } }
   const seated = t.seats.filter(Boolean);
   // shuffle seated guests so the split is random each time
   for (let i = seated.length - 1; i > 0; i--) {
@@ -469,15 +493,42 @@ function moveSplitTable() {
   };
 }
 
+function moveEjectFromOversized() {
+  const big = state.tables.filter(t => tableCapacity(t) > 8 && t.seats.filter(Boolean).length > 6);
+  if (!big.length) return null;
+  const t = big.reduce((a, b) => tableCapacity(a) > tableCapacity(b) ? a : b);
+  const mustPartners = new Set();
+  state.rels.filter(r => r.type === 'must').forEach(r => {
+    if (t.seats.includes(r.a)) mustPartners.add(r.b);
+    if (t.seats.includes(r.b)) mustPartners.add(r.a);
+  });
+  const ejectCandidates = t.seats
+    .map((id, si) => [id, si])
+    .filter(([id]) => id && !mustPartners.has(id));
+  if (!ejectCandidates.length) return null;
+  const [guestId, srcSi] = ejectCandidates[Math.floor(Math.random() * ejectCandidates.length)];
+  const otherSlots = [];
+  state.tables.forEach((ot, ti) => {
+    if (ot === t) return;
+    ot.seats.forEach((v, si) => { if (!v) otherSlots.push([ti, si]); });
+  });
+  if (!otherSlots.length) return null;
+  const [dstTi, dstSi] = otherSlots[Math.floor(Math.random() * otherSlots.length)];
+  t.seats[srcSi] = null;
+  state.tables[dstTi].seats[dstSi] = guestId;
+  return () => { state.tables[dstTi].seats[dstSi] = null; t.seats[srcSi] = guestId; };
+}
+
 function randomMoveInPlace() {
   const r = Math.random();
-  if (r < 0.35) return moveSwap();
-  if (r < 0.60) return movePlaceUnseated(); // weighted highest — seating everyone matters most
-  if (r < 0.68) return moveGrowTable();
-  if (r < 0.76) return moveShrinkTable();
-  if (r < 0.82) return moveDeleteEmptyTable();
-  if (r < 0.88) return moveMergeTables();
-  if (r < 0.94) return moveSplitTable(); // direct path to "fewer, smaller tables"
+  if (r < 0.25) return moveSwap();
+  if (r < 0.42) return movePlaceUnseated();
+  if (r < 0.45) return moveGrowTable();
+  if (r < 0.55) return moveShrinkTable();
+  if (r < 0.60) return moveDeleteEmptyTable();
+  if (r < 0.64) return moveMergeTables();
+  if (r < 0.78) return moveSplitTable();
+  if (r < 0.94) return moveEjectFromOversized();
   return moveAddTable();
 }
 
@@ -511,16 +562,18 @@ function greedySeatEveryone() {
   // whole table to themselves. A cluster is never split across bins, so "must" pairs stay intact;
   // the stochastic search then only has to polish this for social fit (and split it back up if a
   // packed-together bin scores badly), not discover the consolidation from scratch.
-  const maxCap = 2 * MAX_LINKED + 2;
+  const greedyCap = 6;
+  const hardMaxCap = 2 * MAX_LINKED + 2;
   const bins = [];
   [...byCluster.values()].sort((a, b) => b.length - a.length).forEach(cluster => {
-    if (cluster.length > maxCap) {
-      for (let i = 0; i < cluster.length; i += maxCap) bins.push(cluster.slice(i, i + maxCap));
+    if (cluster.length > hardMaxCap) {
+      for (let i = 0; i < cluster.length; i += hardMaxCap) bins.push(cluster.slice(i, i + hardMaxCap));
       return;
     }
+    const binCap = Math.max(greedyCap, cluster.length);
     let target = null, bestRemaining = Infinity;
     bins.forEach(bin => {
-      const remaining = maxCap - bin.length;
+      const remaining = binCap - bin.length;
       if (cluster.length <= remaining && remaining < bestRemaining) { target = bin; bestRemaining = remaining; }
     });
     if (target) target.push(...cluster);
@@ -552,7 +605,7 @@ function hillClimb(iterations) {
     const newPlan = planScore();
     const newScore = searchScore(newPlan);
     const delta = newScore - currentScore;
-    const temperature = 20 * (1 - i / iterations) + 0.5;
+    const temperature = 150 * (1 - i / iterations) + 1;
     if (delta >= 0 || Math.random() < Math.exp(delta / temperature)) {
       currentScore = newScore;
       if (isBetterPlan(newPlan, bestPlan)) { bestPlan = newPlan; bestSnapshot = cloneAllTables(); }
@@ -573,10 +626,46 @@ function runSeatingOptimizer() {
   greedySeatEveryone();
   const workingBaseline = cloneAllTables();
 
-  const RESTARTS = 8, ITERATIONS = 2500;
+  function makeSmallTableSeed() {
+    restoreAllTables(workingBaseline);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const t of state.tables) {
+        if (t.linked >= 2 && t.seats.filter(Boolean).length > 4) {
+          const seated = t.seats.filter(Boolean);
+          for (let i = seated.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [seated[i], seated[j]] = [seated[j], seated[i]];
+          }
+          const linkedA = Math.floor(t.linked / 2);
+          const linkedB = t.linked - linkedA;
+          const capA = 2 * linkedA + 2, capB = 2 * linkedB + 2;
+          const halfA = seated.slice(0, Math.min(seated.length, capA));
+          const halfB = seated.slice(halfA.length, halfA.length + Math.min(seated.length - halfA.length, capB));
+          if (halfA.length <= capA && halfB.length <= capB) {
+            const idx = state.tables.indexOf(t);
+            t.linked = linkedA;
+            t.seats = halfA.concat(Array(capA - halfA.length).fill(null));
+            state.tables.splice(idx + 1, 0, {
+              id: crypto.randomUUID(), name: t.name + 's', linked: linkedB,
+              seats: halfB.concat(Array(capB - halfB.length).fill(null)),
+              x: t.x + 20, y: t.y + 20,
+            });
+            changed = true;
+            break;
+          }
+        }
+      }
+    }
+    return cloneAllTables();
+  }
+  const smallSeed = makeSmallTableSeed();
+
+  const RESTARTS = 12, ITERATIONS = 8000;
   let bestSnapshot = workingBaseline, bestScore = planScore();
   for (let r = 0; r < RESTARTS; r++) {
-    restoreAllTables(workingBaseline);
+    restoreAllTables(r < 2 ? workingBaseline : smallSeed);
     hillClimb(ITERATIONS);
     const candidateScore = planScore();
     if (isBetterPlan(candidateScore, bestScore)) { bestScore = candidateScore; bestSnapshot = cloneAllTables(); }
@@ -618,7 +707,7 @@ const _highsReady = (async () => {
   } catch (e) { console.warn('HiGHS WASM unavailable:', e); }
 })();
 
-function milpConversationBonus(cap) { return Math.max(0, 3 - 0.75 * (cap - 4)); }
+function milpConversationBonus(cap) { return cap <= 6 ? 3 : cap <= 8 ? 1 : 0; }
 
 function buildMILPModel() {
   const N = state.guests.length;
@@ -653,7 +742,9 @@ function buildMILPModel() {
   const sizes = [{ linked: 1, cap: 4 }];
   if (N > 4 || maxCluster > 4) sizes.push({ linked: 2, cap: 6 });
   if (N > 12 || maxCluster > 6) sizes.push({ linked: 3, cap: 8 });
-  if (maxCluster > 8) { const lk = Math.ceil((maxCluster - 2) / 2); sizes.push({ linked: lk, cap: 2 * lk + 2 }); }
+  if (N > 20 || maxCluster > 8) sizes.push({ linked: 4, cap: 10 });
+  if (N > 30 || maxCluster > 10) sizes.push({ linked: 5, cap: 12 });
+  if (maxCluster > 12) { const lk = Math.ceil((maxCluster - 2) / 2); sizes.push({ linked: lk, cap: 2 * lk + 2 }); }
 
   const candidates = [];
   sizes.forEach(s => {
@@ -672,7 +763,7 @@ function buildMILPModel() {
       const b = milpConversationBonus(candidates[t].cap);
       if (b > 0) obj.push(`${b} g${i}t${t}`);
     }
-  candidates.forEach((c, t) => obj.push(`- ${1 + 0.1 * c.cap} u${t}`));
+  candidates.forEach((c, t) => obj.push(`- ${1 + 0.15 * c.cap * c.cap / 8} u${t}`));
 
   let lp = 'Maximize\n obj: ' + (obj.length ? obj.join(' + ').replace(/\+ - /g, '- ') : '0') + '\n';
   lp += 'Subject To\n';
